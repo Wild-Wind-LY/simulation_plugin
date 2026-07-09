@@ -1,0 +1,7 @@
+/build/*
+.cache
+.vscode
+.claude
+/download/*
+/lib/*
+/3rd/*
