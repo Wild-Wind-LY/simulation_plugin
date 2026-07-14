@@ -1,0 +1,46 @@
+[
+  {
+    "envelope": {
+      "service": "simulation.http",
+      "options": {
+        "timeout": 5000
+      }
+    },
+    "payload": {
+      "module": "instance.create",
+      "data": {
+        "id": "smoke",
+        "model_path": "/home/liuyan/rpc_gateway_plugins/simulation_plugin/tests/simple_model.xml"
+      }
+    }
+  },
+  {
+    "envelope": {
+      "service": "simulation.http",
+      "options": {
+        "timeout": 5000
+      }
+    },
+    "payload": {
+      "module": "instance.step",
+      "data": {
+        "id": "smoke",
+        "count": 10
+      }
+    }
+  },
+  {
+    "envelope": {
+      "service": "simulation.http",
+      "options": {
+        "timeout": 5000
+      }
+    },
+    "payload": {
+      "module": "instance.destroy",
+      "data": {
+        "id": "smoke"
+      }
+    }
+  }
+]

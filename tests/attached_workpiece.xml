@@ -1,0 +1,8 @@
+<mujoco model="attached_workpiece">
+  <worldbody>
+    <body name="workpiece">
+      <freejoint/>
+      <geom name="workpiece_geom" type="box" size="0.04 0.03 0.02" mass="0.1" rgba="0.9 0.55 0.1 1"/>
+    </body>
+  </worldbody>
+</mujoco>

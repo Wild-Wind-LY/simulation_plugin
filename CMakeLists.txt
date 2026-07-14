@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.14)
 project(SimulationPlugin VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -15,23 +15,6 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 # --------- Dependencies ---------
 include(cmake/CPM.cmake)
 
-if(EXISTS "${CMAKE_SOURCE_DIR}/3rd/fmt-11.2.0/CMakeLists.txt")
-  message(STATUS "Using local fmt")
-  CPMAddPackage(
-    NAME fmt
-    VERSION 11.2.0
-    SOURCE_DIR "${CMAKE_SOURCE_DIR}/3rd/fmt-11.2.0"
-  )
-else()
-  message(STATUS "Downloading fmt via CPM")
-  CPMAddPackage(
-    NAME fmt
-    VERSION 11.2.0
-    GITHUB_REPOSITORY fmtlib/fmt
-    GIT_TAG 11.2.0
-  )
-endif()
-
 set(MUJOCO_BUILD_EXAMPLES OFF CACHE BOOL MuJoCo FORCE)
 set(MUJOCO_BUILD_SIMULATE OFF CACHE BOOL MuJoCo FORCE)
 set(MUJOCO_BUILD_STUDIO OFF CACHE BOOL MuJoCo FORCE)
@@ -47,14 +30,14 @@ CPMAddPackage(
 
 find_package(nlohmann_json REQUIRED)
 find_package(xplugin-dev REQUIRED)
-
+find_package(Threads REQUIRED)
 
 file(GLOB_RECURSE sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/source/*.cpp")
 add_library(${PROJECT_NAME} SHARED ${sources})
 target_compile_definitions(${PROJECT_NAME} PRIVATE PLUGIN_LOG_NAME=SimulationPlugin)
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
-  nlohmann_json fmt::fmt-header-only xplugin::sdk mujoco::mujoco
+  nlohmann_json xplugin::sdk mujoco::mujoco Threads::Threads
 )
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
@@ -75,3 +58,21 @@ endforeach()
 add_custom_command(TARGET ${PROJECT_NAME} PRE_LINK
   COMMAND ${CMAKE_COMMAND} -E make_directory "${RPC_GATEWAY_PLUGIN_OUTPUT_DIR}"
 )
+
+enable_testing()
+add_executable(simulation_manager_smoke
+  tests/simulation_manager_smoke.cpp
+  source/simulation_instance.cpp
+  source/simulation_instance_manager.cpp
+  source/simulation_compiler.cpp
+  source/simulation_scene_manager.cpp
+  source/simulation_task_manager.cpp
+  source/simulation_record_manager.cpp
+  source/simulation_model_validator.cpp
+  source/simulation_model_registry.cpp
+)
+target_link_libraries(simulation_manager_smoke PRIVATE
+  nlohmann_json mujoco::mujoco Threads::Threads
+)
+
+add_test(NAME simulation_manager_smoke COMMAND simulation_manager_smoke)

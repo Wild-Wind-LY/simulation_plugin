@@ -1,0 +1,91 @@
+{
+  "id": "falling_box_scene",
+  "name": "Falling Box Demo",
+  "model_path": "simple_model.xml",
+  "objects": [
+    {
+      "id": "obstacle_box_1",
+      "type": "obstacle.box",
+      "pos": [
+        0.35,
+        0,
+        0.05
+      ],
+      "size": [
+        0.08,
+        0.08,
+        0.05
+      ],
+      "rgba": [
+        0.8,
+        0.2,
+        0.15,
+        1
+      ]
+    },
+    {
+      "id": "included_payload_1",
+      "type": "model.include",
+      "source": "included_payload.xml",
+      "pos": [
+        -0.3,
+        0,
+        0.1
+      ]
+    }
+  ],
+  "sensors": [
+    {
+      "id": "box_force_sensor",
+      "type": "sensor.force",
+      "site": "box_force_site"
+    },
+    {
+      "id": "box_torque_sensor",
+      "type": "sensor.torque",
+      "site": "box_force_site"
+    }
+  ],
+  "defaults": {
+    "step_hz": 120,
+    "publish_hz": 12,
+    "qpos": [
+      0,
+      0,
+      1,
+      1,
+      0,
+      0,
+      0
+    ],
+    "qvel": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "ctrl": []
+  },
+  "models": [
+    {
+      "id": "workpiece_asset",
+      "source": "attached_workpiece.xml",
+      "pos": [
+        0.2,
+        0.2,
+        0.3
+      ]
+    }
+  ],
+  "contacts": {
+    "excludes": [
+      {
+        "name": "workpiece_obstacle_exclude",
+        "body1": "obstacle_box_1",
+        "body2": "workpiece_asset_workpiece"
+      }
+    ]
+  }
+}
