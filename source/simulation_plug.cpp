@@ -1,12 +1,10 @@
-#include "simulation_plug.hpp"
+﻿#include "simulation_plug.hpp"
 
 #include <exception>
+#include <string_view>
 #include <utility>
+#include <vector>
 
-/*
-- Scene Layer：只描述“有什么”，例如 obstacle、sensor�?- Compile Layer：负责把 obstacle/senso
-翻译�?MJCF�?- Simulation Layer：完全不用知�?obstacle/sensor 是怎么生成的，只加�?compiled XML�?- Task
-Layer：还没做，后面负责程序、轨迹、机器人动作�?*/
 bool SimulationPlug::on_init(IPluginContext& ctx) noexcept {
   // 设置插件全局日志
   LOGX_GLOBAL_CLASS(PLUGIN_LOG_NAME)::Construct();
@@ -17,101 +15,126 @@ bool SimulationPlug::on_init(IPluginContext& ctx) noexcept {
 }
 
 bool SimulationPlug::on_start() noexcept {
-  const bool registered = register_json_service(
-      "simulation.http",
-      {
-          {"scene.load", [this](const nlohmann::json& data) { return handle_scene_load(data); }},
-          {"scene.unload",
-           [this](const nlohmann::json& data) { return handle_scene_unload(data); }},
-          {"scene.update",
-           [this](const nlohmann::json& data) { return handle_scene_update(data); }},
-          {"scene.apply", [this](const nlohmann::json& data) { return handle_scene_apply(data); }},
-          {"scene.list", [this](const nlohmann::json& data) { return handle_scene_list(data); }},
-          {"scene.info", [this](const nlohmann::json& data) { return handle_scene_info(data); }},
-          {"scene.validate",
-           [this](const nlohmann::json& data) { return handle_scene_validate(data); }},
-          {"scene.diff", [this](const nlohmann::json& data) { return handle_scene_diff(data); }},
-          {"scene.compile",
-           [this](const nlohmann::json& data) { return handle_scene_compile(data); }},
-          {"scene.export",
-           [this](const nlohmann::json& data) { return handle_scene_export(data); }},
-          {"visual.scene",
-           [this](const nlohmann::json& data) { return handle_visual_scene(data); }},
-          {"visual.model",
-           [this](const nlohmann::json& data) { return handle_visual_model(data); }},
-          {"instance.create",
-           [this](const nlohmann::json& data) { return handle_instance_create(data); }},
-          {"instance.recreate_from_scene",
-           [this](const nlohmann::json& data) {
-             return handle_instance_recreate_from_scene(data);
-           }},
-          {"instance.start",
-           [this](const nlohmann::json& data) { return handle_instance_start(data); }},
-          {"instance.pause",
-           [this](const nlohmann::json& data) { return handle_instance_pause(data); }},
-          {"instance.stop",
-           [this](const nlohmann::json& data) { return handle_instance_stop(data); }},
-          {"instance.step",
-           [this](const nlohmann::json& data) { return handle_instance_step(data); }},
-          {"instance.reset",
-           [this](const nlohmann::json& data) { return handle_instance_reset(data); }},
-          {"instance.apply_runtime",
-           [this](const nlohmann::json& data) { return handle_instance_apply_runtime(data); }},
-          {"instance.state",
-           [this](const nlohmann::json& data) { return handle_instance_state(data); }},
-          {"instance.metadata",
-           [this](const nlohmann::json& data) { return handle_instance_metadata(data); }},
-          {"instance.list",
-           [this](const nlohmann::json& data) { return handle_instance_list(data); }},
-          {"task.create", [this](const nlohmann::json& data) { return handle_task_create(data); }},
-          {"task.remove", [this](const nlohmann::json& data) { return handle_task_remove(data); }},
-          {"task.list", [this](const nlohmann::json& data) { return handle_task_list(data); }},
-          {"task.info", [this](const nlohmann::json& data) { return handle_task_info(data); }},
-          {"task.run", [this](const nlohmann::json& data) { return handle_task_run(data); }},
-          {"record.start",
-           [this](const nlohmann::json& data) { return handle_record_start(data); }},
-          {"record.stop", [this](const nlohmann::json& data) { return handle_record_stop(data); }},
-          {"record.list", [this](const nlohmann::json& data) { return handle_record_list(data); }},
-          {"record.info", [this](const nlohmann::json& data) { return handle_record_info(data); }},
-          {"record.remove",
-           [this](const nlohmann::json& data) { return handle_record_remove(data); }},
-          {"model.register",
-           [this](const nlohmann::json& data) { return handle_model_register(data); }},
-          {"model.list", [this](const nlohmann::json& data) { return handle_model_list(data); }},
-          {"model.info", [this](const nlohmann::json& data) { return handle_model_info(data); }},
-          {"model.remove",
-           [this](const nlohmann::json& data) { return handle_model_remove(data); }},
-          {"model.cache_prune",
-           [this](const nlohmann::json& data) { return handle_model_cache_prune(data); }},
-          {"model.verify",
-           [this](const nlohmann::json& data) { return handle_model_verify(data); }},
-          {"model.validate",
-           [this](const nlohmann::json& data) { return handle_model_validate(data); }},
-          {"model.inspect",
-           [this](const nlohmann::json& data) { return handle_model_inspect(data); }},
-          {"control.joint_state",
-           [this](const nlohmann::json& data) { return handle_control_joint_state(data); }},
-          {"control.sensor_state",
-           [this](const nlohmann::json& data) { return handle_control_sensor_state(data); }},
-          {"control.write_ctrl",
-           [this](const nlohmann::json& data) { return handle_control_write_ctrl(data); }},
-          {"instance.destroy",
-           [this](const nlohmann::json& data) { return handle_instance_destroy(data); }},
-      });
+  routes_ = std::make_shared<const JsonRpcRouter::RouteMap>(build_routes());
 
-  if (!registered) {
-    LOG_ERROR("[{}] Failed to register simulation.http", TAG);
+  // 路由声明交给 Host：方法检查、404/405、CORS、per-route 指标都由 HTTP Gateway 完成
+  PluginHttpEndpointOptions http_options;
+  http_options.methods = {"POST"};
+  http_options.routes.reserve(routes_->size());
+  for (const auto& entry : *routes_) {
+    http_options.routes.push_back(PluginHttpRoute{"/" + entry.first, {"POST"}});
+  }
+  http_options.max_body_size = 8 * 1024 * 1024;
+  // 与 max_body_size 一致，保证 body 不落盘，handler 里能直接从内存解析 JSON
+  http_options.max_memory_body_size = 8 * 1024 * 1024;
+  http_options.timeout_ms = 30000;
+  http_options.max_concurrency = 16;
+  // visual.model 全量几何（mesh 顶点/面片 JSON）会超过 Host 默认 16 MiB 的响应体上限
+  http_options.max_response_body_size = 256 * 1024 * 1024;
+  // 大响应给足发送预算（默认 30s）；并发下载沿用 Host 默认 4 路
+  http_options.download_timeout_ms = 60000;
+  if (!register_http_endpoint(
+          "simulation", [this](const PluginHttpRequest& req) { return handle_http_rpc(req); },
+          std::move(http_options))) {
+    LOG_ERROR("[{}] Failed to register simulation http endpoint", TAG);
     return false;
   }
 
-  LOG_INFO("[{}] simulation.http is ready", TAG);
+  // 实时状态推送：ws://<host>/backend/plugin-ws/simulation
+  if (!register_ws_endpoint(
+          "simulation",
+          [this](const char* session_id, const void* data, size_t size, PluginWsMessageType type) {
+            handle_ws_message(session_id, data, size, type);
+          },
+          [this](const char* session_id) { handle_ws_open(session_id); },
+          [this](const char* session_id) { handle_ws_close(session_id); })) {
+    LOG_ERROR("[{}] Failed to register simulation ws endpoint", TAG);
+    return false;
+  }
+
+  LOG_INFO(
+      "[{}] http: POST /backend/plugin-http/simulation/<module> ({} routes) | ws: "
+      "/backend/plugin-ws/simulation",
+      TAG, routes_->size());
+
   LOG_INFO("[{}] Started!", TAG);
   return true;
+}
+
+JsonRpcRouter::RouteMap SimulationPlug::build_routes() {
+  return {
+      {"scene.load", [this](const nlohmann::json& data) { return handle_scene_load(data); }},
+      {"scene.unload", [this](const nlohmann::json& data) { return handle_scene_unload(data); }},
+      {"scene.update", [this](const nlohmann::json& data) { return handle_scene_update(data); }},
+      {"scene.apply", [this](const nlohmann::json& data) { return handle_scene_apply(data); }},
+      {"scene.list", [this](const nlohmann::json& data) { return handle_scene_list(data); }},
+      {"scene.info", [this](const nlohmann::json& data) { return handle_scene_info(data); }},
+      {"scene.validate",
+       [this](const nlohmann::json& data) { return handle_scene_validate(data); }},
+      {"scene.diff", [this](const nlohmann::json& data) { return handle_scene_diff(data); }},
+      {"scene.compile", [this](const nlohmann::json& data) { return handle_scene_compile(data); }},
+      {"scene.export", [this](const nlohmann::json& data) { return handle_scene_export(data); }},
+      {"visual.scene", [this](const nlohmann::json& data) { return handle_visual_scene(data); }},
+      {"visual.model", [this](const nlohmann::json& data) { return handle_visual_model(data); }},
+      {"instance.create",
+       [this](const nlohmann::json& data) { return handle_instance_create(data); }},
+      {"instance.recreate_from_scene",
+       [this](const nlohmann::json& data) { return handle_instance_recreate_from_scene(data); }},
+      {"instance.start",
+       [this](const nlohmann::json& data) { return handle_instance_start(data); }},
+      {"instance.pause",
+       [this](const nlohmann::json& data) { return handle_instance_pause(data); }},
+      {"instance.stop", [this](const nlohmann::json& data) { return handle_instance_stop(data); }},
+      {"instance.step", [this](const nlohmann::json& data) { return handle_instance_step(data); }},
+      {"instance.reset",
+       [this](const nlohmann::json& data) { return handle_instance_reset(data); }},
+      {"instance.apply_runtime",
+       [this](const nlohmann::json& data) { return handle_instance_apply_runtime(data); }},
+      {"instance.state",
+       [this](const nlohmann::json& data) { return handle_instance_state(data); }},
+      {"instance.metadata",
+       [this](const nlohmann::json& data) { return handle_instance_metadata(data); }},
+      {"instance.destroy",
+       [this](const nlohmann::json& data) { return handle_instance_destroy(data); }},
+      {"instance.list", [this](const nlohmann::json& data) { return handle_instance_list(data); }},
+      {"task.create", [this](const nlohmann::json& data) { return handle_task_create(data); }},
+      {"task.remove", [this](const nlohmann::json& data) { return handle_task_remove(data); }},
+      {"task.list", [this](const nlohmann::json& data) { return handle_task_list(data); }},
+      {"task.info", [this](const nlohmann::json& data) { return handle_task_info(data); }},
+      {"task.run", [this](const nlohmann::json& data) { return handle_task_run(data); }},
+      {"record.start", [this](const nlohmann::json& data) { return handle_record_start(data); }},
+      {"record.stop", [this](const nlohmann::json& data) { return handle_record_stop(data); }},
+      {"record.list", [this](const nlohmann::json& data) { return handle_record_list(data); }},
+      {"record.info", [this](const nlohmann::json& data) { return handle_record_info(data); }},
+      {"record.remove", [this](const nlohmann::json& data) { return handle_record_remove(data); }},
+      {"model.register",
+       [this](const nlohmann::json& data) { return handle_model_register(data); }},
+      {"model.list", [this](const nlohmann::json& data) { return handle_model_list(data); }},
+      {"model.info", [this](const nlohmann::json& data) { return handle_model_info(data); }},
+      {"model.remove", [this](const nlohmann::json& data) { return handle_model_remove(data); }},
+      {"model.cache_prune",
+       [this](const nlohmann::json& data) { return handle_model_cache_prune(data); }},
+      {"model.verify", [this](const nlohmann::json& data) { return handle_model_verify(data); }},
+      {"model.validate",
+       [this](const nlohmann::json& data) { return handle_model_validate(data); }},
+      {"model.inspect", [this](const nlohmann::json& data) { return handle_model_inspect(data); }},
+      {"control.joint_state",
+       [this](const nlohmann::json& data) { return handle_control_joint_state(data); }},
+      {"control.sensor_state",
+       [this](const nlohmann::json& data) { return handle_control_sensor_state(data); }},
+      {"control.write_ctrl",
+       [this](const nlohmann::json& data) { return handle_control_write_ctrl(data); }},
+
+  };
 }
 
 void SimulationPlug::on_stop() noexcept {
   records_.stop_all();
   instances_.stop_all();
+  {
+    std::lock_guard<std::mutex> lock(ws_mutex_);
+    ws_subscriptions_.clear();
+  }
   LOG_INFO("[{}] Stopped!", TAG);
 }
 
@@ -226,7 +249,8 @@ JsonRpcResult SimulationPlug::handle_scene_validate(const nlohmann::json& data) 
   try {
     nlohmann::json scene = data;
     if (data.contains("id") && data["id"].is_string()) scene = scenes_.info(data);
-    return JsonRpcResult::ok("scene validation", compiler_.validate_scene(resolve_scene_models(scene)));
+    return JsonRpcResult::ok("scene validation",
+                             compiler_.validate_scene(resolve_scene_models(scene)));
   } catch (const std::exception& e) {
     return route_error("scene.validate", e);
   }
@@ -256,7 +280,8 @@ JsonRpcResult SimulationPlug::handle_scene_diff(const nlohmann::json& data) {
 JsonRpcResult SimulationPlug::handle_scene_compile(const nlohmann::json& data) {
   try {
     const auto scene = scenes_.info(data);
-    return JsonRpcResult::ok("scene compiled", compiler_.compile_scene(resolve_scene_models(scene)));
+    return JsonRpcResult::ok("scene compiled",
+                             compiler_.compile_scene(resolve_scene_models(scene)));
   } catch (const std::exception& e) {
     return route_error("scene.compile", e);
   }
@@ -265,10 +290,9 @@ JsonRpcResult SimulationPlug::handle_scene_compile(const nlohmann::json& data) {
 JsonRpcResult SimulationPlug::handle_scene_export(const nlohmann::json& data) {
   try {
     const auto scene = scenes_.info(data);
-    return JsonRpcResult::ok("scene exported",
-                             compiler_.export_scene(resolve_scene_models(scene),
-                                                    data.value("out_dir", ""),
-                                                    data.value("flatten", true)));
+    return JsonRpcResult::ok("scene exported", compiler_.export_scene(resolve_scene_models(scene),
+                                                                      data.value("out_dir", ""),
+                                                                      data.value("flatten", true)));
   } catch (const std::exception& e) {
     return route_error("scene.export", e);
   }
@@ -284,7 +308,8 @@ JsonRpcResult SimulationPlug::handle_visual_scene(const nlohmann::json& data) {
       if (!lookup.contains("id") && lookup.contains("scene_id")) lookup["id"] = lookup["scene_id"];
       scene = scenes_.info(lookup);
     }
-    return JsonRpcResult::ok("visual scene", compiler_.build_visual_scene(resolve_scene_models(scene)));
+    return JsonRpcResult::ok("visual scene",
+                             compiler_.build_visual_scene(resolve_scene_models(scene)));
   } catch (const std::exception& e) {
     return route_error("visual.scene", e);
   }
@@ -492,8 +517,7 @@ JsonRpcResult SimulationPlug::handle_model_remove(const nlohmann::json& data) {
 JsonRpcResult SimulationPlug::handle_model_cache_prune(const nlohmann::json& data) {
   try {
     (void)data;
-    return JsonRpcResult::ok("model cache pruned",
-                             {{"removed", compiler_.prune_unused_models()}});
+    return JsonRpcResult::ok("model cache pruned", {{"removed", compiler_.prune_unused_models()}});
   } catch (const std::exception& e) {
     return route_error("model.cache_prune", e);
   }
@@ -632,6 +656,150 @@ JsonRpcResult SimulationPlug::route_error(const char* action, const std::excepti
   return JsonRpcResult::error(e.what(), -1, 400);
 }
 
+namespace {
+  PluginHttpResponse to_http_response(const JsonRpcResult& result) {
+    PluginHttpResponse res;
+    res.status_code = result.http_status;
+    res.content_type = "application/json; charset=utf-8";
+    nlohmann::json out{{"code", result.code}, {"message", result.message}};
+    if (!result.data.is_null()) out["data"] = result.data;
+    const auto text = out.dump();
+    res.body.assign(text.begin(), text.end());
+    return res;
+  }
+}  // namespace
+
+PluginHttpResponse SimulationPlug::handle_http_rpc(const PluginHttpRequest& req) {
+  try {
+    // Host 已超时(504)或客户端已断开时不再执行重活（scene.compile 等）
+    if (req.stop_token.stop_requested()) {
+      return to_http_response(JsonRpcResult::error("request canceled", -1, 503));
+    }
+
+    if (req.body_spooled_to_file()) {
+      return to_http_response(JsonRpcResult::error("request body too large", -1, 413));
+    }
+
+    // Host 已按声明的 routes 匹配：route_pattern 形如 "/scene.load"，未命中根本到不了这里
+    std::string module = req.route_pattern;
+    if (!module.empty() && module.front() == '/') module.erase(0, 1);
+
+    const auto route = routes_->find(module);
+    if (route == routes_->end()) {
+      return to_http_response(JsonRpcResult::error("Handler not found: " + module, -1, 404));
+    }
+
+    nlohmann::json data = nlohmann::json::object();
+    if (!req.text().empty()) {
+      data = nlohmann::json::parse(req.text());
+      if (!data.is_object()) {
+        return to_http_response(
+            JsonRpcResult::error("Request body must be a json object", -1, 400));
+      }
+    }
+
+    return to_http_response(route->second(data));
+  } catch (const nlohmann::json::parse_error& e) {
+    return to_http_response(
+        JsonRpcResult::error(std::string("Invalid json: ") + e.what(), -1, 400));
+  } catch (const std::exception& e) {
+    return to_http_response(JsonRpcResult::error(std::string("Http RPC error: ") + e.what()));
+  } catch (...) {
+    return to_http_response(JsonRpcResult::error("Http RPC unknown error"));
+  }
+}
+
+void SimulationPlug::handle_ws_open(const char* session_id) {
+  if (!session_id) return;
+  const nlohmann::json hello{
+      {"type", "hello"},
+      {"endpoint", "simulation"},
+      {"usage",
+       R"(send {"action":"subscribe","instances":["<id>"],"visual":true}; ["*"] subscribes all; visual attaches geom poses)"}};
+  ws_send_text(session_id, hello.dump());
+}
+
+void SimulationPlug::handle_ws_close(const char* session_id) {
+  if (!session_id) return;
+  std::lock_guard<std::mutex> lock(ws_mutex_);
+  ws_subscriptions_.erase(session_id);
+}
+
+void SimulationPlug::handle_ws_message(const char* session_id, const void* data, size_t size,
+                                       PluginWsMessageType type) {
+  if (!session_id || type != PluginWsMessageType::Text) return;
+
+  const auto reply = [&](const nlohmann::json& j) { ws_send_text(session_id, j.dump()); };
+
+  nlohmann::json msg;
+  try {
+    msg = nlohmann::json::parse(std::string_view(static_cast<const char*>(data), size));
+  } catch (const std::exception& e) {
+    reply({{"type", "error"}, {"message", std::string("Invalid json: ") + e.what()}});
+    return;
+  }
+
+  try {
+    const std::string action = msg.value("action", "");
+
+    std::unordered_set<std::string> instances;
+    if (msg.contains("instances") && msg["instances"].is_array()) {
+      for (const auto& item : msg["instances"]) {
+        if (item.is_string()) instances.insert(item.get<std::string>());
+      }
+    } else if (msg.contains("instance") && msg["instance"].is_string()) {
+      instances.insert(msg["instance"].get<std::string>());
+    }
+    if (instances.empty()) instances.insert("*");
+
+    if (action == "subscribe") {
+      bool visual = false;
+      {
+        std::lock_guard<std::mutex> lock(ws_mutex_);
+        auto& sub = ws_subscriptions_[session_id];
+        if (instances.count("*") != 0) {
+          sub.instances = {"*"};
+        } else {
+          sub.instances.insert(instances.begin(), instances.end());
+        }
+        if (msg.contains("visual")) sub.visual = msg.value("visual", false);
+        visual = sub.visual;
+      }
+      reply({{"type", "ack"},
+             {"action", "subscribe"},
+             {"instances", instances},
+             {"visual", visual}});
+      return;
+    }
+
+    if (action == "unsubscribe") {
+      {
+        std::lock_guard<std::mutex> lock(ws_mutex_);
+        const auto it = ws_subscriptions_.find(session_id);
+        if (it != ws_subscriptions_.end()) {
+          if (instances.count("*") != 0) {
+            ws_subscriptions_.erase(it);
+          } else {
+            for (const auto& id : instances) it->second.instances.erase(id);
+            if (it->second.instances.empty()) ws_subscriptions_.erase(it);
+          }
+        }
+      }
+      reply({{"type", "ack"}, {"action", "unsubscribe"}, {"instances", instances}});
+      return;
+    }
+
+    if (action == "ping") {
+      reply({{"type", "pong"}});
+      return;
+    }
+
+    reply({{"type", "error"}, {"message", "Unknown action: " + action}});
+  } catch (const std::exception& e) {
+    reply({{"type", "error"}, {"message", e.what()}});
+  }
+}
+
 nlohmann::json SimulationPlug::resolve_scene_models(const nlohmann::json& scene) const {
   return model_registry_.resolve_scene(scene);
 }
@@ -644,6 +812,35 @@ void SimulationPlug::publish_state(const nlohmann::json& state) noexcept {
     const std::string topic = "simulation.instance." + id + ".state";
     const std::string payload = state.dump();
     emit_text(topic.c_str(), payload);
+
+    std::vector<std::string> plain_targets;
+    std::vector<std::string> visual_targets;
+    {
+      std::lock_guard<std::mutex> lock(ws_mutex_);
+      for (const auto& [session_id, sub] : ws_subscriptions_) {
+        if (sub.instances.count("*") == 0 && sub.instances.count(id) == 0) continue;
+        (sub.visual ? visual_targets : plain_targets).push_back(session_id);
+      }
+    }
+    if (plain_targets.empty() && visual_targets.empty()) return;
+
+    nlohmann::json event{{"type", "state"}, {"topic", topic}, {"data", state}};
+    if (!plain_targets.empty()) {
+      const std::string text = event.dump();
+      for (const auto& session_id : plain_targets) ws_send_text(session_id.c_str(), text);
+    }
+    if (!visual_targets.empty()) {
+      // 附带 geom 世界位姿（transforms-only），浏览器端按 geom_id 增量更新 3D 预览。
+      // 实例刚销毁等竞态下取不到位姿时退化为纯状态推送。
+      try {
+        if (!state.value("destroyed", false)) {
+          event["visual"] = instances_.visual_model({{"id", id}, {"include_geometry", false}});
+        }
+      } catch (...) {
+      }
+      const std::string text = event.dump();
+      for (const auto& session_id : visual_targets) ws_send_text(session_id.c_str(), text);
+    }
   } catch (const std::exception& e) {
     LOG_ERROR("[{}] publish_state failed: {}", TAG, e.what());
   } catch (...) {

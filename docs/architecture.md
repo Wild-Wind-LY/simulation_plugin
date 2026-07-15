@@ -1,5 +1,35 @@
 # Simulation Plugin Architecture
 
+## Transports
+
+The plugin owns its own gateway endpoints; it no longer registers a service-bus JSON
+service, so the legacy `POST /backend/plugin-http/plugin-data` envelope path
+(`envelope.service = "simulation.http"`) is gone. If another plugin ever needs in-process
+RPC into the simulation runtime, re-add `register_json_service` over the same route map.
+
+- **HTTP endpoint (RPC):** `POST http://<host>:53101/backend/plugin-http/simulation/<module>`
+  with the request body as the module's `data` object (empty body allowed), e.g.
+  `POST .../simulation/scene.list`. Every module in the route table is declared to the
+  Host as an explicit `PluginHttpRoute`, so method checks, 404/405 for unknown routes,
+  CORS preflight, and per-route metrics are handled by the HTTP Gateway before the plugin
+  runs. Responses are `{"code", "message", "data"}` with the module's HTTP status.
+  Endpoint limits: POST only, 8 MiB body, 30 s handler timeout, per-endpoint metrics in
+  plugin-admin.
+- **WebSocket endpoint (state streaming):** `ws://<host>:53101/backend/plugin-ws/simulation`.
+  Client messages: `{"action": "subscribe", "instances": ["<id>", ...], "visual": true}` (or
+  `"instance": "<id>"`; omit or `"*"` to subscribe to all instances; optional `visual`
+  attaches transforms), `{"action": "unsubscribe", ...}` symmetric, `{"action": "ping"}`
+  → `{"type": "pong"}`.
+  Server pushes `{"type": "state", "topic": "simulation.instance.<id>.state", "data": {...}}`
+  for every state publication (start/pause/stop/step/reset/write_ctrl and the periodic
+  `publish_hz` snapshots), including the terminal `{"status": "destroyed"}` event.
+  With `"visual": true` the push also carries `"visual"`: the transforms-only
+  `visual.model` payload (`geometry_included: false`, current `geom` world poses), so a
+  browser that loaded full geometry once can animate the 3D preview purely from the push
+  stream — no polling.
+  The internal event-bus topic `simulation.instance.<id>.state` is still published for
+  in-process subscribers.
+
 The plugin uses four primary concepts with explicit ownership boundaries:
 
 ```text

@@ -1,7 +1,11 @@
 #pragma once
 
 #include <exception>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "plugin_core/sdk/plugin_logx.hpp"
 #include "plugin_core/sdk/plugin_sdk.hpp"
@@ -23,6 +27,13 @@ private:
   bool on_start() noexcept override;
   void on_stop() noexcept override;
   void on_unload() noexcept override;
+
+  JsonRpcRouter::RouteMap build_routes();
+  PluginHttpResponse handle_http_rpc(const PluginHttpRequest& req);
+  void handle_ws_message(const char* session_id, const void* data, size_t size,
+                         PluginWsMessageType type);
+  void handle_ws_open(const char* session_id);
+  void handle_ws_close(const char* session_id);
 
   JsonRpcResult handle_scene_load(const nlohmann::json& data);
   JsonRpcResult handle_scene_unload(const nlohmann::json& data);
@@ -74,7 +85,15 @@ private:
   void publish_state(const nlohmann::json& state) noexcept;
 
 private:
+  struct WsSubscription {
+    std::unordered_set<std::string> instances;  // 含 "*" 表示订阅全部实例
+    bool visual{false};                         // 推送时附带 geom 位姿（3D 预览用）
+  };
+
   const std::string TAG = "仿真插件";
+  std::shared_ptr<const JsonRpcRouter::RouteMap> routes_;
+  std::mutex ws_mutex_;
+  std::unordered_map<std::string, WsSubscription> ws_subscriptions_;
   SimulationSceneManager scenes_;
   SimulationModelRegistry model_registry_;
   SimulationCompiler compiler_;
