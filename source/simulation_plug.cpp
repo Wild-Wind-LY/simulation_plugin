@@ -1,9 +1,15 @@
 ﻿#include "simulation_plug.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include "simulation_visual.hpp"
 
 bool SimulationPlug::on_init(IPluginContext& ctx) noexcept {
   // 设置插件全局日志
@@ -20,13 +26,17 @@ bool SimulationPlug::on_start() noexcept {
   // 路由声明交给 Host：方法检查、404/405、CORS、per-route 指标都由 HTTP Gateway 完成
   PluginHttpEndpointOptions http_options;
   http_options.methods = {"POST"};
-  http_options.routes.reserve(routes_->size());
+  http_options.routes.reserve(routes_->size() + 1);
   for (const auto& entry : *routes_) {
     http_options.routes.push_back(PluginHttpRoute{"/" + entry.first, {"POST"}});
   }
-  http_options.max_body_size = 8 * 1024 * 1024;
-  // 与 max_body_size 一致，保证 body 不落盘，handler 里能直接从内存解析 JSON
+  // multipart 模型上传（浏览器直传模型 + mesh，注册进资产库）
+  http_options.routes.push_back(PluginHttpRoute{"/model.upload", {"POST"}});
+  http_options.max_body_size = 256 * 1024 * 1024;
+  // JSON 请求超过 8 MiB 会落盘并被 handler 拒绝（同旧行为）；大 body 只允许 multipart 上传
   http_options.max_memory_body_size = 8 * 1024 * 1024;
+  http_options.max_memory_part_size = 8 * 1024 * 1024;
+  http_options.upload_timeout_ms = 120000;
   http_options.timeout_ms = 30000;
   http_options.max_concurrency = 16;
   // visual.model 全量几何（mesh 顶点/面片 JSON）会超过 Host 默认 16 MiB 的响应体上限
@@ -41,13 +51,18 @@ bool SimulationPlug::on_start() noexcept {
   }
 
   // 实时状态推送：ws://<host>/backend/plugin-ws/simulation
+  PluginWsEndpointOptions ws_options;
+  ws_options.max_message_size = 8 * 1024 * 1024;
+  ws_options.max_sessions = 128;
+  ws_options.max_send_queue_messages = 64;
+  ws_options.max_send_queue_bytes = 32 * 1024 * 1024;
   if (!register_ws_endpoint(
           "simulation",
           [this](const char* session_id, const void* data, size_t size, PluginWsMessageType type) {
             handle_ws_message(session_id, data, size, type);
           },
           [this](const char* session_id) { handle_ws_open(session_id); },
-          [this](const char* session_id) { handle_ws_close(session_id); })) {
+          [this](const char* session_id) { handle_ws_close(session_id); }, ws_options)) {
     LOG_ERROR("[{}] Failed to register simulation ws endpoint", TAG);
     return false;
   }
@@ -64,6 +79,8 @@ bool SimulationPlug::on_start() noexcept {
 JsonRpcRouter::RouteMap SimulationPlug::build_routes() {
   return {
       {"scene.load", [this](const nlohmann::json& data) { return handle_scene_load(data); }},
+      {"scene.create", [this](const nlohmann::json& data) { return handle_scene_create(data); }},
+      {"scene.save", [this](const nlohmann::json& data) { return handle_scene_save(data); }},
       {"scene.unload", [this](const nlohmann::json& data) { return handle_scene_unload(data); }},
       {"scene.update", [this](const nlohmann::json& data) { return handle_scene_update(data); }},
       {"scene.apply", [this](const nlohmann::json& data) { return handle_scene_apply(data); }},
@@ -118,6 +135,7 @@ JsonRpcRouter::RouteMap SimulationPlug::build_routes() {
       {"model.validate",
        [this](const nlohmann::json& data) { return handle_model_validate(data); }},
       {"model.inspect", [this](const nlohmann::json& data) { return handle_model_inspect(data); }},
+      {"model.visual", [this](const nlohmann::json& data) { return handle_model_visual(data); }},
       {"control.joint_state",
        [this](const nlohmann::json& data) { return handle_control_joint_state(data); }},
       {"control.sensor_state",
@@ -151,6 +169,22 @@ JsonRpcResult SimulationPlug::handle_scene_load(const nlohmann::json& data) {
     return JsonRpcResult::ok("scene loaded", scenes_.load(data));
   } catch (const std::exception& e) {
     return route_error("scene.load", e);
+  }
+}
+
+JsonRpcResult SimulationPlug::handle_scene_create(const nlohmann::json& data) {
+  try {
+    return JsonRpcResult::ok("scene created", scenes_.create(data));
+  } catch (const std::exception& e) {
+    return route_error("scene.create", e);
+  }
+}
+
+JsonRpcResult SimulationPlug::handle_scene_save(const nlohmann::json& data) {
+  try {
+    return JsonRpcResult::ok("scene saved", scenes_.save(data));
+  } catch (const std::exception& e) {
+    return route_error("scene.save", e);
   }
 }
 
@@ -280,8 +314,30 @@ JsonRpcResult SimulationPlug::handle_scene_diff(const nlohmann::json& data) {
 JsonRpcResult SimulationPlug::handle_scene_compile(const nlohmann::json& data) {
   try {
     const auto scene = scenes_.info(data);
-    return JsonRpcResult::ok("scene compiled",
-                             compiler_.compile_scene(resolve_scene_models(scene)));
+    auto result = compiler_.compile_scene(resolve_scene_models(scene));
+    // include_visual: 无需创建实例即可拿到编译几何，编辑器用它渲染真实模型。
+    // 临时 mjData 只做一次 mj_forward 取世界位姿，用完即弃。
+    if (data.value("include_visual", false)) {
+      const bool include_geometry = data.value("include_geometry", true);
+      if (auto model
+          = compiler_.get_compiled_model(result.value("compiled_model_id", std::string{}))) {
+        if (mjData* tmp = mj_makeData(model.get())) {
+          // 预览应用场景 defaults.qpos，让初始关节角与实例创建后一致（宽容截断，静默跳过非法值）
+          const nlohmann::json defaults = scene.value("defaults", nlohmann::json::object());
+          const nlohmann::json qpos = defaults.value("qpos", nlohmann::json::array());
+          if (qpos.is_array() && !qpos.empty()) {
+            const int count = std::min<int>(model->nq, static_cast<int>(qpos.size()));
+            for (int i = 0; i < count; ++i) {
+              if (qpos[i].is_number()) tmp->qpos[i] = qpos[i].get<double>();
+            }
+          }
+          mj_forward(model.get(), tmp);
+          result["visual"] = simulation_visual_json(model.get(), tmp, include_geometry);
+          mj_deleteData(tmp);
+        }
+      }
+    }
+    return JsonRpcResult::ok("scene compiled", std::move(result));
   } catch (const std::exception& e) {
     return route_error("scene.compile", e);
   }
@@ -495,6 +551,32 @@ JsonRpcResult SimulationPlug::handle_model_info(const nlohmann::json& data) {
   }
 }
 
+JsonRpcResult SimulationPlug::handle_model_visual(const nlohmann::json& data) {
+  try {
+    // 独立编译注册资产（不需要场景/实例），返回默认位形（qpos0）的几何。
+    // 编辑器用它生成资产库缩略图和首次拖拽的即时预览。
+    const auto info = model_registry_.info(data);
+    const std::string path = info.value("effective_path", "");
+    if (path.empty()) throw std::invalid_argument("model has no effective file");
+    auto [cache_model_id, model] = compiler_.get_or_load_model(path);
+    if (!model) throw std::runtime_error("failed to load model: " + path);
+    nlohmann::json result = {
+        {"id", info.value("id", "")},
+        {"version", info.value("version", "")},
+        {"format", info.value("format", "")},
+        {"cache_model_id", cache_model_id},
+    };
+    if (mjData* tmp = mj_makeData(model.get())) {
+      mj_forward(model.get(), tmp);
+      result.update(simulation_visual_json(model.get(), tmp, data.value("include_geometry", true)));
+      mj_deleteData(tmp);
+    }
+    return JsonRpcResult::ok("model visual", std::move(result));
+  } catch (const std::exception& e) {
+    return route_error("model.visual", e);
+  }
+}
+
 JsonRpcResult SimulationPlug::handle_model_remove(const nlohmann::json& data) {
   try {
     const std::string id = data.value("id", data.value("model_id", ""));
@@ -676,13 +758,16 @@ PluginHttpResponse SimulationPlug::handle_http_rpc(const PluginHttpRequest& req)
       return to_http_response(JsonRpcResult::error("request canceled", -1, 503));
     }
 
-    if (req.body_spooled_to_file()) {
-      return to_http_response(JsonRpcResult::error("request body too large", -1, 413));
-    }
-
     // Host 已按声明的 routes 匹配：route_pattern 形如 "/scene.load"，未命中根本到不了这里
     std::string module = req.route_pattern;
     if (!module.empty() && module.front() == '/') module.erase(0, 1);
+
+    // multipart 上传单独处理（大文件走 parts，不受 JSON body 限制）
+    if (module == "model.upload") return handle_model_upload(req);
+
+    if (req.body_spooled_to_file()) {
+      return to_http_response(JsonRpcResult::error("request body too large", -1, 413));
+    }
 
     const auto route = routes_->find(module);
     if (route == routes_->end()) {
@@ -706,6 +791,131 @@ PluginHttpResponse SimulationPlug::handle_http_rpc(const PluginHttpRequest& req)
     return to_http_response(JsonRpcResult::error(std::string("Http RPC error: ") + e.what()));
   } catch (...) {
     return to_http_response(JsonRpcResult::error("Http RPC unknown error"));
+  }
+}
+
+namespace {
+  // 上传文件名允许携带相对子目录（mesh 引用），但绝不允许逃出上传目录
+  std::filesystem::path sanitize_upload_rel_path(std::string name) {
+    std::replace(name.begin(), name.end(), '\\', '/');
+    std::filesystem::path out;
+    for (const auto& part : std::filesystem::path(name)) {
+      const auto text = part.string();
+      if (text.empty() || text == "." || text == ".." || text == "/") continue;
+      if (text.find(':') != std::string::npos) continue;  // 丢弃 Windows 盘符段
+      out /= text;
+    }
+    if (out.empty() || out.is_absolute())
+      throw std::invalid_argument("invalid upload filename: " + name);
+    return out;
+  }
+
+  std::string safe_dir_token(const std::string& text) {
+    std::string out;
+    for (const char ch : text) {
+      const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+                      || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-';
+      out.push_back(ok ? ch : '_');
+    }
+    return out.empty() ? std::string("x") : out;
+  }
+
+  bool looks_like_model_file(const std::filesystem::path& rel) {
+    const auto ext = rel.extension().string();
+    return ext == ".xml" || ext == ".urdf" || ext == ".mjcf" || ext == ".XML" || ext == ".URDF";
+  }
+}  // namespace
+
+PluginHttpResponse SimulationPlug::handle_model_upload(const PluginHttpRequest& req) {
+  namespace fs = std::filesystem;
+  fs::path upload_dir;
+  try {
+    if (!req.multipart()) {
+      return to_http_response(
+          JsonRpcResult::error("model.upload requires multipart/form-data", -1, 400));
+    }
+
+    const auto field_text = [&](const char* name) -> std::string {
+      const auto* part = req.part(name);
+      if (!part || part->body_spooled_to_file()) return {};
+      return std::string(part->text());
+    };
+
+    const std::string id = field_text("id");
+    std::string version = field_text("version");
+    if (version.empty()) version = "1";
+    if (id.empty()) {
+      return to_http_response(JsonRpcResult::error("missing 'id' form field", -1, 400));
+    }
+
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    upload_dir
+        = fs::path("build") / "model_uploads"
+          / (safe_dir_token(id) + "_" + safe_dir_token(version) + "_" + std::to_string(now_ms));
+    fs::create_directories(upload_dir);
+
+    // 落盘所有文件 part，保留相对子目录结构（meshdir/include 引用可继续解析）
+    fs::path model_file;
+    fs::path first_file;
+    size_t file_count = 0;
+    for (const auto& part : req.parts) {
+      if (part.filename.empty()) continue;
+      const auto rel = sanitize_upload_rel_path(part.filename);
+      const auto dest = upload_dir / rel;
+      fs::create_directories(dest.parent_path());
+
+      if (part.body_spooled_to_file()) {
+        fs::copy_file(part.body_file_path, dest, fs::copy_options::overwrite_existing);
+      } else {
+        std::ofstream out(dest, std::ios::binary | std::ios::trunc);
+        if (!out) throw std::runtime_error("failed to write upload file: " + dest.string());
+        out.write(reinterpret_cast<const char*>(part.body.data()),
+                  static_cast<std::streamsize>(part.body.size()));
+        if (!out.good()) throw std::runtime_error("failed to write upload file: " + dest.string());
+      }
+      ++file_count;
+      if (first_file.empty()) first_file = dest;
+      if (model_file.empty() && (part.name == "model" || looks_like_model_file(rel))) {
+        model_file = dest;
+      }
+    }
+    if (file_count == 0) {
+      return to_http_response(JsonRpcResult::error("no file parts in upload", -1, 400));
+    }
+    if (model_file.empty()) model_file = first_file;
+
+    nlohmann::json payload{
+        {"id", id},
+        {"version", version},
+        {"path", model_file.string()},
+        {"asset_root", upload_dir.string()},
+        {"copy_assets", true},
+        {"replace", field_text("replace") == "true"},
+    };
+    if (!field_text("require_actuators").empty()) {
+      payload["require_actuators"] = field_text("require_actuators") == "true";
+    }
+
+    // 注册即快照进资产库，随后清理临时上传目录
+    auto result = handle_model_register(payload);
+    std::error_code ec;
+    fs::remove_all(upload_dir, ec);
+    return to_http_response(result);
+  } catch (const std::exception& e) {
+    if (!upload_dir.empty()) {
+      std::error_code ec;
+      fs::remove_all(upload_dir, ec);
+    }
+    LOG_ERROR("[{}] model.upload failed: {}", TAG, e.what());
+    return to_http_response(JsonRpcResult::error(e.what(), -1, 400));
+  } catch (...) {
+    if (!upload_dir.empty()) {
+      std::error_code ec;
+      fs::remove_all(upload_dir, ec);
+    }
+    return to_http_response(JsonRpcResult::error("model.upload unknown error"));
   }
 }
 
@@ -765,10 +975,8 @@ void SimulationPlug::handle_ws_message(const char* session_id, const void* data,
         if (msg.contains("visual")) sub.visual = msg.value("visual", false);
         visual = sub.visual;
       }
-      reply({{"type", "ack"},
-             {"action", "subscribe"},
-             {"instances", instances},
-             {"visual", visual}});
+      reply(
+          {{"type", "ack"}, {"action", "subscribe"}, {"instances", instances}, {"visual", visual}});
       return;
     }
 
@@ -827,7 +1035,8 @@ void SimulationPlug::publish_state(const nlohmann::json& state) noexcept {
     nlohmann::json event{{"type", "state"}, {"topic", topic}, {"data", state}};
     if (!plain_targets.empty()) {
       const std::string text = event.dump();
-      for (const auto& session_id : plain_targets) ws_send_text(session_id.c_str(), text);
+      for (const auto& session_id : plain_targets)
+        ws_send_latest_text(session_id.c_str(), topic.c_str(), text);
     }
     if (!visual_targets.empty()) {
       // 附带 geom 世界位姿（transforms-only），浏览器端按 geom_id 增量更新 3D 预览。
@@ -839,7 +1048,8 @@ void SimulationPlug::publish_state(const nlohmann::json& state) noexcept {
       } catch (...) {
       }
       const std::string text = event.dump();
-      for (const auto& session_id : visual_targets) ws_send_text(session_id.c_str(), text);
+      for (const auto& session_id : visual_targets)
+        ws_send_latest_text(session_id.c_str(), topic.c_str(), text);
     }
   } catch (const std::exception& e) {
     LOG_ERROR("[{}] publish_state failed: {}", TAG, e.what());

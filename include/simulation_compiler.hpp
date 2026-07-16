@@ -1,12 +1,13 @@
 #pragma once
 
+#include <mujoco/mujoco.h>
+
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
-#include <mujoco/mujoco.h>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <unordered_map>
@@ -59,12 +60,9 @@ private:
   static std::string numeric_list(const nlohmann::json& values, const std::string& fallback,
                                   int expected_size);
   static nlohmann::json numeric_array(const nlohmann::json& values,
-                                      std::initializer_list<double> fallback,
-                                      int expected_size);
+                                      std::initializer_list<double> fallback, int expected_size);
   static std::string compile_primitive_object(const nlohmann::json& object);
   static std::string compile_sensor_object(const nlohmann::json& sensor);
-  static std::string compile_model_include_object(const nlohmann::json& scene,
-                                                  const nlohmann::json& object);
   static std::string structural_model_id(const nlohmann::json& scene);
   static ModelPtr load_model(const std::filesystem::path& path);
   std::filesystem::path write_compiled_mjcf(const nlohmann::json& scene) const;

@@ -1,11 +1,13 @@
 #include "simulation_instance.hpp"
-#include "simulation_mujoco_utils.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+
+#include "simulation_mujoco_utils.hpp"
+#include "simulation_visual.hpp"
 
 namespace {
 
@@ -57,8 +59,7 @@ namespace {
 
 }  // namespace
 
-SimulationInstance::CreateResult SimulationInstance::create(std::string id,
-                                                            std::string model_path,
+SimulationInstance::CreateResult SimulationInstance::create(std::string id, std::string model_path,
                                                             ModelPtr shared_model) {
   if (!shared_model) {
     char error[1024] = {};
@@ -478,92 +479,10 @@ nlohmann::json SimulationInstance::visual_model_locked(bool include_geometry) co
   if (!model_ || !data_) return out;
 
   mj_forward(model_, data_);
-  out["geometry_included"] = include_geometry;
+  out.update(simulation_visual_json(model_, data_, include_geometry));
   out["status"] = status_text(status_);
   out["time"] = data_->time;
   out["step_count"] = step_count_;
-  out["ncon"] = data_->ncon;
-  out["ngeom"] = model_->ngeom;
-  out["model_counts"] = {
-      {"body", model_->nbody},
-      {"joint", model_->njnt},
-      {"dof", model_->nv},
-      {"geom", model_->ngeom},
-      {"site", model_->nsite},
-      {"actuator", model_->nu},
-      {"sensor", model_->nsensor},
-      {"tendon", model_->ntendon},
-      {"equality", model_->neq},
-      {"contact_pair", model_->npair},
-      {"contact_exclude", model_->nexclude},
-      {"mesh", model_->nmesh},
-      {"height_field", model_->nhfield},
-      {"material", model_->nmat},
-      {"texture", model_->ntex},
-      {"camera", model_->ncam},
-      {"light", model_->nlight},
-      {"nq", model_->nq},
-      {"nv", model_->nv},
-      {"na", model_->na},
-      {"nu", model_->nu},
-  };
-  for (int i = 0; i < model_->ngeom; ++i) {
-    const int type = model_->geom_type[i];
-    const int body_id = model_->geom_bodyid[i];
-    nlohmann::json item = {
-        {"id", object_name(model_, mjOBJ_GEOM, i).empty() ? "geom_" + std::to_string(i)
-                                                          : object_name(model_, mjOBJ_GEOM, i)},
-        {"geom_id", i},
-        {"body_id", body_id},
-        {"body", body_id >= 0 ? object_name(model_, mjOBJ_BODY, body_id) : std::string{}},
-        {"source", "mujoco.model"},
-        {"kind", "geom"},
-        {"shape", geom_shape(type)},
-        {"geom_type", type},
-        {"pos", numeric_array(data_->geom_xpos + 3 * i, 3)},
-        {"xmat", numeric_array(data_->geom_xmat + 9 * i, 9)},
-        {"size", numeric_array(model_->geom_size + 3 * i, 3)},
-        {"rgba", numeric_array(model_->geom_rgba + 4 * i, 4)},
-    };
-    const int material_id = model_->geom_matid[i];
-    item["material_id"] = material_id;
-    if (material_id >= 0 && material_id < model_->nmat) {
-      item["rgba"] = numeric_array(model_->mat_rgba + 4 * material_id, 4);
-    }
-    if (include_geometry && type == mjGEOM_MESH) {
-      const int mesh_id = model_->geom_dataid[i];
-      item["mesh_id"] = mesh_id;
-      if (mesh_id >= 0 && mesh_id < model_->nmesh) {
-        const int vertex_adr = model_->mesh_vertadr[mesh_id];
-        const int vertex_count = model_->mesh_vertnum[mesh_id];
-        const int face_adr = model_->mesh_faceadr[mesh_id];
-        const int face_count = model_->mesh_facenum[mesh_id];
-        item["vertices"] = numeric_array(model_->mesh_vert + 3 * vertex_adr,
-                                         3 * vertex_count);
-        nlohmann::json faces = nlohmann::json::array();
-        for (int face = 0; face < face_count; ++face) {
-          const int* indices = model_->mesh_face + 3 * (face_adr + face);
-          faces.push_back({indices[0], indices[1], indices[2]});
-        }
-        item["faces"] = std::move(faces);
-      }
-    } else if (include_geometry && type == mjGEOM_HFIELD) {
-      const int hfield_id = model_->geom_dataid[i];
-      item["hfield_id"] = hfield_id;
-      if (hfield_id >= 0 && hfield_id < model_->nhfield) {
-        const int rows = model_->hfield_nrow[hfield_id];
-        const int columns = model_->hfield_ncol[hfield_id];
-        const int data_adr = model_->hfield_adr[hfield_id];
-        item["hfield"] = {
-            {"rows", rows},
-            {"columns", columns},
-            {"size", numeric_array(model_->hfield_size + 4 * hfield_id, 4)},
-            {"data", numeric_array(model_->hfield_data + data_adr, rows * columns)},
-        };
-      }
-    }
-    out["items"].push_back(std::move(item));
-  }
   return out;
 }
 nlohmann::json SimulationInstance::joint_state_locked() const {

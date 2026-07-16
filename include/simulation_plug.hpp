@@ -30,12 +30,15 @@ private:
 
   JsonRpcRouter::RouteMap build_routes();
   PluginHttpResponse handle_http_rpc(const PluginHttpRequest& req);
+  PluginHttpResponse handle_model_upload(const PluginHttpRequest& req);
   void handle_ws_message(const char* session_id, const void* data, size_t size,
                          PluginWsMessageType type);
   void handle_ws_open(const char* session_id);
   void handle_ws_close(const char* session_id);
 
   JsonRpcResult handle_scene_load(const nlohmann::json& data);
+  JsonRpcResult handle_scene_create(const nlohmann::json& data);
+  JsonRpcResult handle_scene_save(const nlohmann::json& data);
   JsonRpcResult handle_scene_unload(const nlohmann::json& data);
   JsonRpcResult handle_scene_update(const nlohmann::json& data);
   JsonRpcResult handle_scene_apply(const nlohmann::json& data);
@@ -67,6 +70,7 @@ private:
   JsonRpcResult handle_model_verify(const nlohmann::json& data);
   JsonRpcResult handle_model_validate(const nlohmann::json& data);
   JsonRpcResult handle_model_inspect(const nlohmann::json& data);
+  JsonRpcResult handle_model_visual(const nlohmann::json& data);
   JsonRpcResult handle_control_joint_state(const nlohmann::json& data);
   JsonRpcResult handle_control_sensor_state(const nlohmann::json& data);
   JsonRpcResult handle_control_write_ctrl(const nlohmann::json& data);

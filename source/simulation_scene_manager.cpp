@@ -29,14 +29,6 @@ nlohmann::json SimulationSceneManager::load(const nlohmann::json& data) {
   scene["id"] = id;
   scene["path"] = scene_path.string();
 
-  if (scene.contains("model_path") && !scene["model_path"].is_string())
-    throw std::invalid_argument("scene 'model_path' must be a string");
-  if (!scene.value("model_path", "").empty()) {
-    std::filesystem::path model_path{scene.value("model_path", "")};
-    if (model_path.is_relative()) model_path = scene_path.parent_path() / model_path;
-    scene["model_path"] = normalize_path(model_path).string();
-  }
-
   if (!scene.contains("defaults") || !scene["defaults"].is_object()) {
     scene["defaults"] = nlohmann::json::object();
   }
@@ -44,6 +36,83 @@ nlohmann::json SimulationSceneManager::load(const nlohmann::json& data) {
   std::lock_guard lock{mutex_};
   scenes_[id] = scene;
   return scene;
+}
+
+nlohmann::json SimulationSceneManager::create(const nlohmann::json& data) {
+  const auto id = require_id(data);
+  const bool replace = data.value("replace", false);
+
+  nlohmann::json scene = data.contains("scene") && data["scene"].is_object()
+                             ? data.at("scene")
+                             : nlohmann::json::object();
+  for (const char* key :
+       {"name", "physics", "environment", "models", "objects", "sensors", "contacts", "defaults"}) {
+    if (data.contains(key)) scene[key] = data.at(key);
+  }
+  scene["id"] = id;
+  if (!scene.contains("models") || !scene["models"].is_array())
+    scene["models"] = nlohmann::json::array();
+  if (!scene.contains("objects") || !scene["objects"].is_array())
+    scene["objects"] = nlohmann::json::array();
+  if (!scene.contains("contacts") || !scene["contacts"].is_object())
+    scene["contacts"] = nlohmann::json::object();
+  if (!scene["contacts"].contains("excludes") || !scene["contacts"]["excludes"].is_array())
+    scene["contacts"]["excludes"] = nlohmann::json::array();
+  if (!scene.contains("defaults") || !scene["defaults"].is_object())
+    scene["defaults"] = nlohmann::json::object();
+
+  std::lock_guard lock{mutex_};
+  if (!replace && scenes_.count(id) != 0)
+    throw std::invalid_argument("scene already exists: " + id + " (pass replace:true)");
+  scenes_[id] = scene;
+  return scene;
+}
+
+nlohmann::json SimulationSceneManager::save(const nlohmann::json& data) {
+  const auto id = require_id(data);
+  std::string path_text = data.value("path", "");
+
+  nlohmann::json scene;
+  {
+    std::lock_guard lock{mutex_};
+    auto it = scenes_.find(id);
+    if (it == scenes_.end()) throw std::out_of_range("scene not found: " + id);
+    if (path_text.empty()) path_text = it->second.value("path", "");
+    scene = it->second;
+  }
+  if (path_text.empty()) path_text = "build/scenes/" + id + ".json";
+
+  const auto scene_path = normalize_path(path_text);
+  std::error_code ec;
+  std::filesystem::create_directories(scene_path.parent_path(), ec);
+
+  // "path" is derived bookkeeping; the file itself must stay relocatable.
+  nlohmann::json to_write = scene;
+  to_write.erase("path");
+
+  const auto tmp_path = scene_path.string() + ".tmp";
+  {
+    std::ofstream out(tmp_path, std::ios::trunc);
+    if (!out) throw std::runtime_error("failed to open scene file for write: " + tmp_path);
+    out << to_write.dump(2) << '\n';
+    if (!out.good()) {
+      out.close();
+      std::filesystem::remove(tmp_path, ec);
+      throw std::runtime_error("failed to write scene file: " + tmp_path);
+    }
+  }
+  std::filesystem::rename(tmp_path, scene_path, ec);
+  if (ec) {
+    std::filesystem::remove(tmp_path, ec);
+    throw std::runtime_error("failed to replace scene file: " + scene_path.string());
+  }
+
+  {
+    std::lock_guard lock{mutex_};
+    auto it = scenes_.find(id);
+    if (it != scenes_.end()) it->second["path"] = scene_path.string();
+  }
+  return {{"id", id}, {"path", scene_path.string()}, {"saved", true}};
 }
 
 nlohmann::json SimulationSceneManager::update(const nlohmann::json& data) {
@@ -62,16 +131,6 @@ nlohmann::json SimulationSceneManager::update(const nlohmann::json& data) {
     scene[item.key()] = item.value();
   }
 
-  if (scene.contains("model_path") && scene["model_path"].is_string()) {
-    std::filesystem::path model_path{scene.value("model_path", "")};
-    if (model_path.is_relative()) {
-      const std::filesystem::path scene_path{scene.value("path", "")};
-      const auto base_dir
-          = scene_path.empty() ? std::filesystem::current_path() : scene_path.parent_path();
-      model_path = base_dir / model_path;
-    }
-    scene["model_path"] = normalize_path(model_path).string();
-  }
   if (!scene.contains("defaults") || !scene["defaults"].is_object()) {
     scene["defaults"] = nlohmann::json::object();
   }
@@ -94,7 +153,6 @@ nlohmann::json SimulationSceneManager::list() const {
     out.push_back({
         {"id", id},
         {"name", scene.value("name", id)},
-        {"model_path", scene.value("model_path", "")},
         {"model_count", scene.value("models", nlohmann::json::array()).size()},
         {"path", scene.value("path", "")},
     });

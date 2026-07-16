@@ -1,6 +1,4 @@
 ﻿#include "simulation_compiler.hpp"
-#include "simulation_hash.hpp"
-#include "simulation_mujoco_utils.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -15,23 +13,14 @@
 #include <utility>
 #include <vector>
 
+#include "simulation_hash.hpp"
+#include "simulation_mujoco_utils.hpp"
+
 namespace {
-
-  bool has_array_items(const nlohmann::json& value, const char* key) {
-    return value.contains(key) && value[key].is_array() && !value[key].empty();
-  }
-
-  bool has_structural_items(const nlohmann::json& scene) {
-    return scene.value("model_path", "").empty() || has_array_items(scene, "models")
-           || has_array_items(scene, "objects") || has_array_items(scene, "sensors")
-           || (scene.contains("contacts") && !scene["contacts"].empty());
-  }
 
   bool is_sensor_type(const std::string& type) {
     return type == "sensor.force" || type == "sensor.torque";
   }
-
-  bool is_model_include_type(const std::string& type) { return type == "model.include"; }
 
   void insert_before_required(std::string& xml, const std::string& marker,
                               const std::string& insertion, const std::string& missing_message) {
@@ -60,7 +49,8 @@ namespace {
 
   nlohmann::json structural_signature(const nlohmann::json& scene) {
     return {
-        {"model_path", scene.value("model_path", "")},
+        {"physics", scene.value("physics", nlohmann::json::object())},
+        {"environment", scene.value("environment", nlohmann::json::object())},
         {"models", scene.value("models", nlohmann::json::array())},
         {"objects", scene.value("objects", nlohmann::json::array())},
         {"sensors", scene.value("sensors", nlohmann::json::array())},
@@ -89,16 +79,24 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
   if (!scene.contains("id") || !scene["id"].is_string() || scene.value("id", "").empty()) {
     add_issue(errors, "$.id", "scene missing string id");
   }
-  if (scene.contains("model_path") && !scene["model_path"].is_string()) {
-    add_issue(errors, "$.model_path", "model_path must be a string");
-  } else if (!scene.value("model_path", "").empty()) {
-    try {
-      const auto model_path = resolve_scene_path(scene, scene.value("model_path", ""));
-      if (!std::filesystem::exists(model_path))
-        add_issue(errors, "$.model_path", "model_path does not exist: " + model_path.string());
-    } catch (const std::exception& e) {
-      add_issue(errors, "$.model_path", e.what());
-    }
+  if (!scene.value("model_path", "").empty()) {
+    add_issue(errors, "$.model_path",
+              "scene model_path is no longer supported; register the base model as an asset and "
+              "reference it in models[], and use scene physics/environment for globals");
+  }
+  if (scene.contains("physics") && !scene["physics"].is_object()) {
+    add_issue(errors, "$.physics", "physics must be an object");
+  } else if (scene.contains("physics")) {
+    const auto& physics = scene["physics"];
+    if (physics.contains("timestep")
+        && (!physics["timestep"].is_number() || physics["timestep"].get<double>() <= 0.0))
+      add_issue(errors, "$.physics.timestep", "physics.timestep must be a positive number");
+    if (physics.contains("gravity")
+        && (!physics["gravity"].is_array() || physics["gravity"].size() != 3))
+      add_issue(errors, "$.physics.gravity", "physics.gravity must be an array of 3 numbers");
+  }
+  if (scene.contains("environment") && !scene["environment"].is_object()) {
+    add_issue(errors, "$.environment", "environment must be an object");
   }
 
   std::set<std::string> ids;
@@ -114,17 +112,24 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
           continue;
         }
         const std::string id = model.value("id", "");
+        const std::string model_id = model.value("model_id", "");
         const std::string source = model.value("source", "");
-        if (id.empty()) add_issue(errors, path + ".id", "model missing id");
+        if (id.empty())
+          add_issue(errors, path + ".id", "model missing id");
         else if (!ids.insert(id).second)
           add_issue(errors, path + ".id", "duplicate scene id: " + id);
-        if (source.empty()) {
-          add_issue(errors, path + ".source", "model missing source");
+        if (model_id.empty()) {
+          add_issue(errors, path + ".model_id",
+                    "model missing model_id (register the asset and reference it by id)");
+        } else if (source.empty()) {
+          add_issue(errors, path + ".model_id",
+                    "model_id did not resolve to a registered asset: " + model_id);
         } else {
           try {
             const auto source_path = resolve_scene_path(scene, source);
             if (!std::filesystem::exists(source_path))
-              add_issue(errors, path + ".source", "model source does not exist: " + source_path.string());
+              add_issue(errors, path + ".source",
+                        "model source does not exist: " + source_path.string());
             if (source_path.extension() == ".urdf")
               add_issue(errors, path + ".source",
                         "attached models must be MJCF; URDF is only supported as a base model");
@@ -154,21 +159,7 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
           add_issue(errors, path + ".id", "duplicate scene object id: " + id);
         }
         if (type.empty()) add_issue(errors, path + ".type", "object missing type");
-        if (type == "model.include") {
-          if (!object.contains("source") || !object["source"].is_string()) {
-            add_issue(errors, path + ".source", "model.include missing source");
-          } else {
-            try {
-              const auto source = resolve_scene_path(scene, object.value("source", ""));
-              if (!std::filesystem::exists(source)) {
-                add_issue(errors, path + ".source",
-                          "include source does not exist: " + source.string());
-              }
-            } catch (const std::exception& e) {
-              add_issue(errors, path + ".source", e.what());
-            }
-          }
-        } else if (is_sensor_type(type)) {
+        if (is_sensor_type(type)) {
           if (object.value("site", "").empty())
             add_issue(errors, path + ".site", "sensor missing site");
         } else if (type != "obstacle.box" && type != "obstacle.sphere"
@@ -213,8 +204,7 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
       for (size_t i = 0; i < excludes.size(); ++i) {
         const auto& item = excludes[i];
         const std::string path = "$.contacts.excludes[" + std::to_string(i) + "]";
-        if (!item.is_object() || item.value("body1", "").empty()
-            || item.value("body2", "").empty())
+        if (!item.is_object() || item.value("body1", "").empty() || item.value("body2", "").empty())
           add_issue(errors, path, "contact exclude requires body1 and body2");
       }
     }
@@ -232,8 +222,13 @@ nlohmann::json SimulationCompiler::diff_scenes(const nlohmann::json& old_scene,
   nlohmann::json structural_changes = nlohmann::json::array();
   nlohmann::json runtime_changes = nlohmann::json::array();
 
-  if (old_scene.value("model_path", "") != new_scene.value("model_path", "")) {
-    append_change(structural_changes, "$.model_path", "model_path");
+  if (old_scene.value("physics", nlohmann::json::object())
+      != new_scene.value("physics", nlohmann::json::object())) {
+    append_change(structural_changes, "$.physics", "physics_options");
+  }
+  if (old_scene.value("environment", nlohmann::json::object())
+      != new_scene.value("environment", nlohmann::json::object())) {
+    append_change(structural_changes, "$.environment", "environment");
   }
   if (old_scene.value("models", nlohmann::json::array())
       != new_scene.value("models", nlohmann::json::array())) {
@@ -276,10 +271,7 @@ nlohmann::json SimulationCompiler::compile_scene(const nlohmann::json& scene) co
     throw std::invalid_argument("scene validation failed: " + validation["errors"].dump());
   }
 
-  const bool generated = has_structural_items(scene);
-  const auto compiled_model_path = generated
-                                       ? write_compiled_mjcf(scene)
-                                       : resolve_scene_path(scene, scene.value("model_path", ""));
+  const auto compiled_model_path = write_compiled_mjcf(scene);
   const std::string compiled_model_id = structural_model_id(scene);
   ModelPtr model;
   {
@@ -298,10 +290,20 @@ nlohmann::json SimulationCompiler::compile_scene(const nlohmann::json& scene) co
   compiled["compiled_model_id"] = compiled_model_id;
   compiled["backend"] = "mujoco";
   compiled["model_path"] = compiled_model_path.string();
-  compiled["generated"] = generated;
+  compiled["generated"] = true;
   compiled["initial_state"] = scene.value("defaults", nlohmann::json::object());
-  compiled["sizes"] = {{"nq", model->nq}, {"nv", model->nv}, {"nu", model->nu},
-                       {"nbody", model->nbody}, {"nsensor", model->nsensor}};
+  compiled["sizes"] = {{"nq", model->nq},
+                       {"nv", model->nv},
+                       {"nu", model->nu},
+                       {"nbody", model->nbody},
+                       {"nsensor", model->nsensor}};
+  // 编译模型里的具名 site：前端场景传感器编辑器的 site 候选来源。
+  // 未命名 site 无法被 MJCF 传感器引用，不能作为候选。
+  compiled["sites"] = nlohmann::json::array();
+  for (int i = 0; i < model->nsite; ++i) {
+    const char* site_name = mj_id2name(model.get(), mjOBJ_SITE, i);
+    if (site_name && site_name[0] != '\0') compiled["sites"].push_back(std::string(site_name));
+  }
   compiled["mapping"] = {
       {"actuators", nlohmann::json::object()},
       {"sensors", nlohmann::json::object()},
@@ -332,12 +334,6 @@ nlohmann::json SimulationCompiler::compile_scene(const nlohmann::json& scene) co
             {"type", type},
             {"site", object.value("site", "")},
         };
-      } else if (is_model_include_type(type)) {
-        compiled["mapping"]["models"][id] = {
-            {"type", type},
-            {"source", resolve_scene_path(scene, object.value("source", "")).string()},
-            {"body", id},
-        };
       } else {
         compiled["mapping"]["bodies"][id] = id;
       }
@@ -367,7 +363,6 @@ nlohmann::json SimulationCompiler::build_visual_scene(const nlohmann::json& scen
 
   nlohmann::json visual = {
       {"scene_id", scene.value("id", "")},
-      {"model_path", scene.value("model_path", "")},
       {"backend", "threejs"},
       {"units", "m"},
       {"coordinate_system", "mujoco_xyz"},
@@ -384,14 +379,15 @@ nlohmann::json SimulationCompiler::build_visual_scene(const nlohmann::json& scen
     for (const auto& model : scene["models"]) {
       const std::string id = model.value("id", "");
       if (id.empty()) continue;
-      append_item({{"id", id},
-                   {"source", "scene.models"},
-                   {"kind", "model_ref"},
-                   {"shape", "model_ref"},
-                   {"model_path", resolve_scene_path(scene, model.value("source", "")).string()},
-                   {"pos", numeric_array(model.value("pos", nlohmann::json::array()), {0, 0, 0}, 3)},
-                   {"quat", numeric_array(model.value("quat", nlohmann::json::array()), {1, 0, 0, 0}, 4)},
-                   {"size", nlohmann::json::array({0.18, 0.18, 0.18})}});
+      append_item(
+          {{"id", id},
+           {"source", "scene.models"},
+           {"kind", "model_ref"},
+           {"shape", "model_ref"},
+           {"model_path", resolve_scene_path(scene, model.value("source", "")).string()},
+           {"pos", numeric_array(model.value("pos", nlohmann::json::array()), {0, 0, 0}, 3)},
+           {"quat", numeric_array(model.value("quat", nlohmann::json::array()), {1, 0, 0, 0}, 4)},
+           {"size", nlohmann::json::array({0.18, 0.18, 0.18})}});
     }
   }
 
@@ -438,18 +434,6 @@ nlohmann::json SimulationCompiler::build_visual_scene(const nlohmann::json& scen
              {"size", numeric_array(object.value("size", nlohmann::json::array()), {0.1, 0.1}, 2)},
              {"rgba", numeric_array(object.value("rgba", nlohmann::json::array()),
                                     {0.1, 0.55, 0.35, 1}, 4)}});
-      } else if (is_model_include_type(type)) {
-        append_item(
-            {{"id", id},
-             {"source", "scene.objects"},
-             {"kind", "model_ref"},
-             {"shape", "model_ref"},
-             {"model_path", resolve_scene_path(scene, object.value("source", "")).string()},
-             {"pos", numeric_array(object.value("pos", nlohmann::json::array()), {0, 0, 0}, 3)},
-             {"quat",
-              numeric_array(object.value("quat", nlohmann::json::array()), {1, 0, 0, 0}, 4)},
-             {"size", nlohmann::json::array({0.12, 0.12, 0.12})},
-             {"rgba", nlohmann::json::array({0.49, 0.83, 1.0, 1.0})}});
       } else if (is_sensor_type(type)) {
         append_item(
             {{"id", id},
@@ -509,7 +493,8 @@ SimulationCompiler::ModelPtr SimulationCompiler::get_compiled_model(
     const std::string& compiled_model_id) const {
   std::lock_guard lock{model_mutex_};
   auto it = models_.find(compiled_model_id);
-  if (it == models_.end()) throw std::out_of_range("compiled model not found: " + compiled_model_id);
+  if (it == models_.end())
+    throw std::out_of_range("compiled model not found: " + compiled_model_id);
   return touch_and_reclaim_locked(compiled_model_id, it->second.model);
 }
 
@@ -524,13 +509,15 @@ std::pair<std::string, SimulationCompiler::ModelPtr> SimulationCompiler::get_or_
 
   std::error_code ec;
   const auto timestamp = std::filesystem::last_write_time(path, ec);
-  const std::string input = path.string() + (ec ? "" : std::to_string(timestamp.time_since_epoch().count()));
+  const std::string input
+      = path.string() + (ec ? "" : std::to_string(timestamp.time_since_epoch().count()));
   const std::string model_id = "direct-" + simulation::sha256_string(input).substr(0, 32);
 
   {
     std::lock_guard lock{model_mutex_};
     auto it = models_.find(model_id);
-    if (it != models_.end()) return {model_id, touch_and_reclaim_locked(model_id, it->second.model)};
+    if (it != models_.end())
+      return {model_id, touch_and_reclaim_locked(model_id, it->second.model)};
   }
   auto loaded = load_model(path);
   std::lock_guard lock{model_mutex_};
@@ -546,8 +533,6 @@ std::string SimulationCompiler::structural_model_id(const nlohmann::json& scene)
     const auto timestamp = std::filesystem::last_write_time(path, ec);
     if (!ec) input << ':' << timestamp.time_since_epoch().count();
   };
-  if (!scene.value("model_path", "").empty())
-    append_timestamp(resolve_scene_path(scene, scene.value("model_path", "")));
   for (const auto& model : scene.value("models", nlohmann::json::array()))
     append_timestamp(resolve_scene_path(scene, model.value("source", "")));
 
@@ -747,51 +732,32 @@ std::string SimulationCompiler::compile_sensor_object(const nlohmann::json& sens
   return xml.str();
 }
 
-std::string SimulationCompiler::compile_model_include_object(const nlohmann::json& scene,
-                                                             const nlohmann::json& object) {
-  if (!object.is_object()) throw std::invalid_argument("model include object must be an object");
-
-  const std::string id = object.value("id", "");
-  if (id.empty()) throw std::invalid_argument("model include missing 'id'");
-
-  const auto source_path = resolve_scene_path(scene, object.value("source", ""));
-  const std::string pos = numeric_list(object.value("pos", nlohmann::json::array()), "0 0 0", 3);
-  const std::string quat
-      = numeric_list(object.value("quat", nlohmann::json::array()), "1 0 0 0", 4);
-
-  std::ifstream input(source_path);
-  if (!input) throw std::runtime_error("failed to open include model: " + source_path.string());
-  std::ostringstream included;
-  included << input.rdbuf();
-  const std::string included_xml = included.str();
-  if (included_xml.find_first_not_of(" \t\r\n") == std::string::npos) {
-    throw std::runtime_error("include model is empty: " + source_path.string());
-  }
-
-  std::ostringstream xml;
-  xml << "    <body name=\"" << xml_escape(id) << "\" pos=\"" << pos << "\" quat=\"" << quat
-      << "\">\n";
-  xml << included_xml;
-  if (!included_xml.empty() && included_xml.back() != '\n') xml << "\n";
-  xml << "    </body>\n";
-  return xml.str();
-}
-
 std::string SimulationCompiler::generate_scene_xml(
     const nlohmann::json& scene,
     const std::function<std::string(const nlohmann::json&, const std::filesystem::path&)>&
         model_file_ref) const {
+  // 场景骨架完全由 compiler 生成：物理参数与环境（地面/灯光）来自场景 JSON，
+  // 机构体全部经注册资产 attach，不再依赖任何基础 MJCF 文件。
   std::string xml;
-  if (scene.value("model_path", "").empty()) {
-    xml = "<mujoco model=\"" + xml_escape(scene.value("id", "scene"))
-          + "\">\n  <worldbody>\n  </worldbody>\n</mujoco>\n";
-  } else {
-    const auto base_model = resolve_scene_path(scene, scene.value("model_path", ""));
-    std::ifstream input(base_model);
-    if (!input) throw std::runtime_error("failed to open base model: " + base_model.string());
-    std::ostringstream buffer;
-    buffer << input.rdbuf();
-    xml = buffer.str();
+  {
+    const auto physics = scene.value("physics", nlohmann::json::object());
+    const auto environment = scene.value("environment", nlohmann::json::object());
+    std::ostringstream skeleton;
+    skeleton << "<mujoco model=\"" << xml_escape(scene.value("id", "scene")) << "\">\n";
+    skeleton << "  <option timestep=\"" << physics.value("timestep", 0.002) << "\" gravity=\""
+             << numeric_list(physics.value("gravity", nlohmann::json::array()), "0 0 -9.81", 3)
+             << "\"/>\n";
+    skeleton << "  <worldbody>\n";
+    if (environment.value("light", true)) {
+      skeleton << "    <light name=\"scene_top_light\" pos=\"0 0 3\" dir=\"0 0 -1\" "
+                  "directional=\"true\"/>\n";
+    }
+    if (environment.value("ground", true)) {
+      skeleton << "    <geom name=\"scene_ground\" type=\"plane\" size=\"5 5 0.1\" "
+                  "rgba=\"0.35 0.4 0.45 1\"/>\n";
+    }
+    skeleton << "  </worldbody>\n</mujoco>\n";
+    xml = skeleton.str();
   }
 
   std::ostringstream assets_xml;
@@ -821,8 +787,6 @@ std::string SimulationCompiler::generate_scene_xml(
       const std::string type = object.value("type", "");
       if (is_sensor_type(type)) {
         sensors_xml << compile_sensor_object(object);
-      } else if (is_model_include_type(type)) {
-        objects_xml << compile_model_include_object(scene, object);
       } else {
         objects_xml << compile_primitive_object(object);
       }
@@ -839,13 +803,12 @@ std::string SimulationCompiler::generate_scene_xml(
     contacts_xml << "    <exclude";
     if (!item.value("name", "").empty())
       contacts_xml << " name=\"" << xml_escape(item.value("name", "")) << "\"";
-    contacts_xml << " body1=\"" << xml_escape(item.value("body1", ""))
-                 << "\" body2=\"" << xml_escape(item.value("body2", "")) << "\"/>\n";
+    contacts_xml << " body1=\"" << xml_escape(item.value("body1", "")) << "\" body2=\""
+                 << xml_escape(item.value("body2", "")) << "\"/>\n";
   }
 
   append_section_xml(xml, "asset", assets_xml.str());
-  insert_before_required(xml, "</worldbody>", objects_xml.str(),
-                         "base model missing </worldbody>");
+  insert_before_required(xml, "</worldbody>", objects_xml.str(), "base model missing </worldbody>");
   append_section_xml(xml, "sensor", sensors_xml.str());
   append_section_xml(xml, "contact", contacts_xml.str());
   return xml;
@@ -853,9 +816,8 @@ std::string SimulationCompiler::generate_scene_xml(
 
 std::filesystem::path SimulationCompiler::write_compiled_mjcf(const nlohmann::json& scene) const {
   const std::string xml = generate_scene_xml(
-      scene, [](const nlohmann::json&, const std::filesystem::path& source) {
-        return source.string();
-      });
+      scene,
+      [](const nlohmann::json&, const std::filesystem::path& source) { return source.string(); });
 
   std::filesystem::create_directories(output_dir_);
   const auto output_path
@@ -881,8 +843,8 @@ namespace {
   void copy_tree(const std::filesystem::path& from, const std::filesystem::path& to) {
     namespace fs = std::filesystem;
     fs::create_directories(to);
-    for (auto it = fs::recursive_directory_iterator(
-             from, fs::directory_options::skip_permission_denied);
+    for (auto it
+         = fs::recursive_directory_iterator(from, fs::directory_options::skip_permission_denied);
          it != fs::recursive_directory_iterator(); ++it) {
       if (it->is_symlink()) continue;
       const auto rel = fs::relative(it->path(), from);
@@ -907,11 +869,10 @@ namespace {
     namespace fs = std::filesystem;
     for (const auto& root : roots) {
       if (!fs::is_directory(root)) continue;
-      for (auto it = fs::recursive_directory_iterator(
-               root, fs::directory_options::skip_permission_denied);
+      for (auto it
+           = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied);
            it != fs::recursive_directory_iterator(); ++it) {
-        if (it->is_regular_file() && it->path().filename().string() == basename)
-          return it->path();
+        if (it->is_regular_file() && it->path().filename().string() == basename) return it->path();
       }
     }
     return std::nullopt;
@@ -951,19 +912,8 @@ nlohmann::json SimulationCompiler::export_scene(const nlohmann::json& scene,
 
   if (!flatten) {
     // ----- modular <attach> bundle (MuJoCo 3.2+) -----
-    // This mode embeds a base model_path / model.include verbatim and only
-    // relocates the packages of `models[]` assets, so external assets pulled in
-    // by those legacy paths are not bundled (the flattened mode below is).
-    if (!scene.value("model_path", "").empty())
-      warnings.push_back(
-          "scene uses a base model_path; its embedded assets are not relocated into the export");
-    for (const auto& object : scene.value("objects", nlohmann::json::array())) {
-      if (is_model_include_type(object.value("type", ""))) {
-        warnings.push_back(
-            "scene contains a model.include object; its embedded assets are not relocated");
-        break;
-      }
-    }
+    // The skeleton is generated and every mechanism comes from a registered
+    // asset package, so the bundle is always self-contained.
 
     const fs::path assets_dir = out_dir / "assets";
     fs::remove_all(assets_dir, ec);
@@ -1005,17 +955,23 @@ nlohmann::json SimulationCompiler::export_scene(const nlohmann::json& scene,
       if (!model)
         throw std::runtime_error(std::string("exported scene failed to load standalone: ")
                                  + (error[0] ? error : "unknown error"));
-      sizes = {{"nq", model->nq}, {"nv", model->nv}, {"nu", model->nu},
-               {"nbody", model->nbody}, {"nsensor", model->nsensor}};
+      sizes = {{"nq", model->nq},
+               {"nv", model->nv},
+               {"nu", model->nu},
+               {"nbody", model->nbody},
+               {"nsensor", model->nsensor}};
       mj_deleteModel(model);
     }
 
     return {
-        {"scene_id", scene_id},        {"export_dir", out_dir.string()},
+        {"scene_id", scene_id},
+        {"export_dir", out_dir.string()},
         {"model_file", model_file.string()},
         {"open_with", "simulate \"" + model_file.string() + "\""},
-        {"mode", "attach"},            {"models", bundled},
-        {"sizes", sizes},              {"warnings", warnings},
+        {"mode", "attach"},
+        {"models", bundled},
+        {"sizes", sizes},
+        {"warnings", warnings},
         {"self_contained", warnings.empty()},
         {"min_mujoco", "3.2.0"},
     };
@@ -1029,8 +985,7 @@ nlohmann::json SimulationCompiler::export_scene(const nlohmann::json& scene,
   const fs::path compose_path = out_dir / ".compose.xml";
   {
     std::ofstream output(compose_path);
-    if (!output)
-      throw std::runtime_error("failed to write compose file: " + compose_path.string());
+    if (!output) throw std::runtime_error("failed to write compose file: " + compose_path.string());
     output << composed;
   }
 
@@ -1042,14 +997,6 @@ nlohmann::json SimulationCompiler::export_scene(const nlohmann::json& scene,
       roots.push_back(fs::weakly_canonical(pkg_text));
     else {
       const auto src = resolve_scene_path(scene, asset.value("source", ""));
-      if (!src.empty()) roots.push_back(src.parent_path());
-    }
-  }
-  if (!scene.value("model_path", "").empty())
-    roots.push_back(resolve_scene_path(scene, scene.value("model_path", "")).parent_path());
-  for (const auto& object : scene.value("objects", nlohmann::json::array())) {
-    if (is_model_include_type(object.value("type", ""))) {
-      const auto src = resolve_scene_path(scene, object.value("source", ""));
       if (!src.empty()) roots.push_back(src.parent_path());
     }
   }
@@ -1080,8 +1027,11 @@ nlohmann::json SimulationCompiler::export_scene(const nlohmann::json& scene,
     collect(model->ntex, model->tex_pathadr, "texture");
     collect(model->nhfield, model->hfield_pathadr, "hfield");
     collect(model->nskin, model->skin_pathadr, "skin");
-    sizes = {{"nq", model->nq}, {"nv", model->nv}, {"nu", model->nu},
-             {"nbody", model->nbody}, {"nsensor", model->nsensor}};
+    sizes = {{"nq", model->nq},
+             {"nv", model->nv},
+             {"nu", model->nu},
+             {"nbody", model->nbody},
+             {"nsensor", model->nsensor}};
     mj_deleteModel(model);
     mj_freeLastXML();
   }
@@ -1127,8 +1077,8 @@ nlohmann::json SimulationCompiler::export_scene(const nlohmann::json& scene,
   {
     char verify_error[2048] = {};
     std::lock_guard xml_lock{simulation_mujoco_xml_mutex()};
-    mjModel* model = mj_loadXML(model_file.string().c_str(), nullptr, verify_error,
-                                sizeof(verify_error));
+    mjModel* model
+        = mj_loadXML(model_file.string().c_str(), nullptr, verify_error, sizeof(verify_error));
     if (!model)
       throw std::runtime_error(std::string("flattened scene failed to load standalone: ")
                                + (verify_error[0] ? verify_error : "unknown error"));

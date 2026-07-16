@@ -10,6 +10,7 @@
 #include "simulation_record_manager.hpp"
 #include "simulation_scene_manager.hpp"
 #include "simulation_task_manager.hpp"
+#include "simulation_visual.hpp"
 
 int main() {
   try {
@@ -25,11 +26,8 @@ int main() {
       std::cerr << "scene list/info failed\n";
       return 1;
     }
-    scene["models"][0]["model_id"] = "workpiece";
-    scene["models"][0]["version"] = "1";
     scene = scenes.update(scene);
-    if (!scenes.references_model("workpiece", "1")
-        || scenes.references_model("workpiece", "2")) {
+    if (!scenes.references_model("workpiece", "1") || scenes.references_model("workpiece", "2")) {
       std::cerr << "scene model reference tracking failed\n";
       return 1;
     }
@@ -51,6 +49,11 @@ int main() {
         {"id", "simple_arm"},
         {"version", "1"},
         {"path", "/home/liuyan/rpc_gateway_plugins/simulation_plugin/tests/simple_arm.urdf"},
+    });
+    registry.register_model({
+        {"id", "falling_box"},
+        {"version", "1"},
+        {"path", "/home/liuyan/rpc_gateway_plugins/simulation_plugin/tests/falling_box.xml"},
     });
     if (registered_mjcf.value("format", "") != "mjcf"
         || registered_urdf.value("format", "") != "urdf"
@@ -78,14 +81,15 @@ int main() {
     };
     auto resolved_registry_scene = reloaded_registry.resolve_scene(registry_scene);
     if (resolved_registry_scene["models"][0].value("source", "").empty()
-        || reloaded_registry.list().size() != 2) {
+        || reloaded_registry.list().size() != 3) {
       std::cerr << "model registry persistence/resolve failed\n";
       return 1;
     }
 
+    const std::string debug_model_path
+        = "/home/liuyan/rpc_gateway_plugins/simulation_plugin/tests/simple_model.xml";
     SimulationModelValidator model_validator;
-    auto model_validation
-        = model_validator.validate({{"model_path", scene.value("model_path", "")}});
+    auto model_validation = model_validator.validate({{"model_path", debug_model_path}});
     if (!model_validation.value("valid", false) || model_validation.value("controllable", true)) {
       std::cerr << "model validation failed\n";
       return 1;
@@ -99,9 +103,8 @@ int main() {
     }
 
     SimulationCompiler compiler;
-    auto [direct_id, direct_model] = compiler.get_or_load_model(scene.value("model_path", ""));
-    auto [direct_id_again, direct_model_again]
-        = compiler.get_or_load_model(scene.value("model_path", ""));
+    auto [direct_id, direct_model] = compiler.get_or_load_model(debug_model_path);
+    auto [direct_id_again, direct_model_again] = compiler.get_or_load_model(debug_model_path);
     if (direct_id != direct_id_again || direct_model != direct_model_again) {
       std::cerr << "direct model cache failed\n";
       return 1;
@@ -119,9 +122,39 @@ int main() {
       std::cerr << "registered URDF scene compile failed\n";
       return 1;
     }
-    auto validation = compiler.validate_scene(scene);
+    // model.visual 路径：注册资产独立编译 -> 默认位形几何（资产库缩略图/首次拖拽预览）
+    {
+      const auto asset_info = reloaded_registry.info({{"id", "workpiece"}});
+      const std::string effective = asset_info.value("effective_path", "");
+      auto [asset_cache_id, asset_model] = compiler.get_or_load_model(effective);
+      if (effective.empty() || !asset_model) {
+        std::cerr << "asset visual: standalone load failed\n";
+        return 1;
+      }
+      mjData* asset_data = mj_makeData(asset_model.get());
+      if (!asset_data) {
+        std::cerr << "asset visual: mjData allocation failed\n";
+        return 1;
+      }
+      mj_forward(asset_model.get(), asset_data);
+      auto asset_visual = simulation_visual_json(asset_model.get(), asset_data, true);
+      mj_deleteData(asset_data);
+      if (asset_visual["items"].empty()
+          || asset_visual["model_counts"].value("geom", 0) != asset_model->ngeom) {
+        std::cerr << "asset visual: extraction failed\n";
+        return 1;
+      }
+    }
+    // 场景模型只允许注册资产引用：编译/校验前都必须经过注册表解析
+    auto resolved_scene = reloaded_registry.resolve_scene(scene);
+    auto validation = compiler.validate_scene(resolved_scene);
     if (!validation.value("valid", false)) {
       std::cerr << "scene validation failed\n";
+      return 1;
+    }
+    auto unresolved_validation = compiler.validate_scene(scene);
+    if (unresolved_validation.value("valid", true)) {
+      std::cerr << "unresolved scene should fail validation\n";
       return 1;
     }
     auto runtime_scene = scene;
@@ -139,14 +172,14 @@ int main() {
       std::cerr << "structural diff failed\n";
       return 1;
     }
-    auto compiled = compiler.compile_scene(scene);
+    auto compiled = compiler.compile_scene(resolved_scene);
     if (!compiled.value("generated", false)
         || !compiled["mapping"]["bodies"].contains("obstacle_box_1")) {
       std::cerr << "compiled obstacle missing\n";
       return 1;
     }
-    if (!compiled["mapping"]["models"].contains("included_payload_1")) {
-      std::cerr << "compiled include missing\n";
+    if (!compiled["mapping"]["models"].contains("workpiece_asset")) {
+      std::cerr << "compiled model mapping missing\n";
       return 1;
     }
     if (!compiled["mapping"]["sensors"].contains("box_force_sensor")
@@ -160,7 +193,7 @@ int main() {
       return 1;
     }
     auto shared_model = compiler.get_compiled_model(compiled.value("compiled_model_id", ""));
-    auto compiled_again = compiler.compile_scene(scene);
+    auto compiled_again = compiler.compile_scene(resolved_scene);
     auto shared_model_again
         = compiler.get_compiled_model(compiled_again.value("compiled_model_id", ""));
     if (shared_model != shared_model_again || shared_model->nq < 14 || shared_model->nexclude < 1
@@ -168,9 +201,36 @@ int main() {
       std::cerr << "compiled model cache/attachment failed\n";
       return 1;
     }
-    auto composed_scene = scene;
+    // scene.compile include_visual 路径：无实例时用临时 mjData 提取编译几何
+    {
+      mjData* preview_data = mj_makeData(shared_model.get());
+      if (!preview_data) {
+        std::cerr << "preview mjData allocation failed\n";
+        return 1;
+      }
+      mj_forward(shared_model.get(), preview_data);
+      auto preview = simulation_visual_json(shared_model.get(), preview_data, true);
+      mj_deleteData(preview_data);
+      if (!preview.value("geometry_included", false)
+          || preview["items"].size() != static_cast<size_t>(shared_model->ngeom)
+          || preview["model_counts"].value("geom", 0) != shared_model->ngeom) {
+        std::cerr << "scene visual preview failed\n";
+        return 1;
+      }
+      bool found_attached_geom = false;
+      for (const auto& item : preview["items"]) {
+        if (item.value("body", "").rfind("workpiece_asset_", 0) == 0) {
+          found_attached_geom = true;
+          break;
+        }
+      }
+      if (!found_attached_geom) {
+        std::cerr << "scene visual preview missing attached model geometry\n";
+        return 1;
+      }
+    }
+    auto composed_scene = resolved_scene;
     composed_scene["id"] = "asset_only_scene";
-    composed_scene.erase("model_path");
     composed_scene["objects"] = nlohmann::json::array();
     composed_scene["sensors"] = nlohmann::json::array();
     composed_scene["contacts"] = nlohmann::json::object();
@@ -178,12 +238,12 @@ int main() {
     auto composed_compiled = compiler.compile_scene(composed_scene);
     auto composed_model
         = compiler.get_compiled_model(composed_compiled.value("compiled_model_id", ""));
-    if (!composed_validation.value("valid", false) || composed_model->nq != 7) {
+    if (!composed_validation.value("valid", false) || composed_model->nq != 14) {
       std::cerr << "asset-only scene compile failed\n";
       return 1;
     }
 
-    auto visual = compiler.build_visual_scene(scene);
+    auto visual = compiler.build_visual_scene(resolved_scene);
     if (visual.value("coordinate_system", "") != "mujoco_xyz"
         || visual.value("items", nlohmann::json::array()).size() < 4) {
       std::cerr << "visual scene builder failed\n";
@@ -200,8 +260,7 @@ int main() {
     auto second_config = config;
     second_config["id"] = "smoke-2";
     auto second_created = manager.create(second_config, shared_model);
-    if (second_created.value("compiled_model_id", "")
-            != created.value("compiled_model_id", "")
+    if (second_created.value("compiled_model_id", "") != created.value("compiled_model_id", "")
         || second_created.value("id", "") != "smoke-2") {
       std::cerr << "shared model instance failed\n";
       return 1;
@@ -273,13 +332,10 @@ int main() {
       return 1;
     }
 
-    auto updated_scene = scenes.update({{"id", "falling_box_scene"},
-                                        {"defaults",
-                                         {{"step_hz", 180},
-                                          {"publish_hz", 18},
-                                          {"qpos", scene["defaults"]["qpos"]},
-                                          {"qvel", scene["defaults"]["qvel"]},
-                                          {"ctrl", scene["defaults"]["ctrl"]}}}});
+    auto updated_scene = scenes.update(
+        {{"id", "falling_box_scene"},
+         {"defaults",
+          {{"step_hz", 180}, {"publish_hz", 18}, {"ctrl", scene["defaults"]["ctrl"]}}}});
     auto apply_diff = compiler.diff_scenes(scene, updated_scene);
     if (!apply_diff.value("can_apply_runtime", false)) {
       std::cerr << "scene update runtime diff failed\n";
@@ -385,7 +441,8 @@ int main() {
 
     auto structural_updated_scene
         = scenes.update({{"id", "falling_box_scene"}, {"objects", structural_scene["objects"]}});
-    auto structural_compiled = compiler.compile_scene(structural_updated_scene);
+    auto structural_compiled
+        = compiler.compile_scene(reloaded_registry.resolve_scene(structural_updated_scene));
     auto structural_config = compiler.build_instance_config(
         {{"id", "smoke"}, {"scene_id", "falling_box_scene"}}, structural_compiled);
     auto structural_model
@@ -425,7 +482,7 @@ int main() {
     return 1;
   }
 
-  std::filesystem::remove_all(
-      std::filesystem::temp_directory_path() / "simulation_plugin_registry_smoke");
+  std::filesystem::remove_all(std::filesystem::temp_directory_path()
+                              / "simulation_plugin_registry_smoke");
   return 0;
 }

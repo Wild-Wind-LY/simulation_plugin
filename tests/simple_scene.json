@@ -1,7 +1,40 @@
 {
   "id": "falling_box_scene",
   "name": "Falling Box Demo",
-  "model_path": "simple_model.xml",
+  "physics": {
+    "timestep": 0.01,
+    "gravity": [
+      0,
+      0,
+      -9.81
+    ]
+  },
+  "environment": {
+    "ground": true,
+    "light": true
+  },
+  "models": [
+    {
+      "id": "box_1",
+      "model_id": "falling_box",
+      "version": "1",
+      "pos": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "id": "workpiece_asset",
+      "model_id": "workpiece",
+      "version": "1",
+      "pos": [
+        0.2,
+        0.2,
+        0.3
+      ]
+    }
+  ],
   "objects": [
     {
       "id": "obstacle_box_1",
@@ -22,63 +55,25 @@
         0.15,
         1
       ]
-    },
-    {
-      "id": "included_payload_1",
-      "type": "model.include",
-      "source": "included_payload.xml",
-      "pos": [
-        -0.3,
-        0,
-        0.1
-      ]
     }
   ],
   "sensors": [
     {
       "id": "box_force_sensor",
       "type": "sensor.force",
-      "site": "box_force_site"
+      "site": "box_1_box_force_site"
     },
     {
       "id": "box_torque_sensor",
       "type": "sensor.torque",
-      "site": "box_force_site"
+      "site": "box_1_box_force_site"
     }
   ],
   "defaults": {
     "step_hz": 120,
     "publish_hz": 12,
-    "qpos": [
-      0,
-      0,
-      1,
-      1,
-      0,
-      0,
-      0
-    ],
-    "qvel": [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-    ],
     "ctrl": []
   },
-  "models": [
-    {
-      "id": "workpiece_asset",
-      "source": "attached_workpiece.xml",
-      "pos": [
-        0.2,
-        0.2,
-        0.3
-      ]
-    }
-  ],
   "contacts": {
     "excludes": [
       {

@@ -56,11 +56,21 @@ Registration is transactional and produces a self-contained, portable, integrity
 RPC modules:
 
 - `model.register`: register a versioned MJCF/URDF asset; use `replace: true` to replace a version. Accepts `copy_assets`, `asset_root`, `require_actuators`, and `max_asset_bytes`.
+- `model.upload` (HTTP only): browser-direct `multipart/form-data` upload. Form fields `id`,
+  `version`, `replace`, `require_actuators`; file parts may carry relative sub-paths
+  (sanitized against traversal) so meshes/textures keep resolving. Files are staged under
+  `build/model_uploads/<id>_<version>_<ts>/`, registered with `copy_assets: true` (the
+  registry snapshots them into its own storage), then the staging directory is removed.
+  Endpoint accepts bodies up to 256 MiB; parts above 8 MiB stream through temp files.
 - `model.list`, `model.info`, `model.remove`: manage registered versions. Omitting `version` resolves the latest by semantic-version ordering (`1.10 > 1.9`). `model.remove` deletes the version's package directory.
 - `model.verify`: re-check that a registered version's effective file still matches the digest recorded at registration.
 - `model.cache_prune`: release cached compiled models which have no live instance references.
 - `model.validate`: parse and compile an arbitrary model file temporarily.
 - `model.inspect`: inspect the model used by an existing instance.
+- `model.visual`: compile a registered version standalone (no scene/instance) and return the
+  same geometry/site/texture JSON as `visual.model`, at the model's default configuration
+  (qpos0). The editor uses it for asset-library thumbnails and instant first-drag previews;
+  the compiled model lands in the shared timestamp-aware cache.
 
 ## 2. Scene Configuration
 
@@ -69,6 +79,8 @@ A scene is the stable editor/API contract. It places reusable model assets and d
 ```json
 {
   "id": "cell_001",
+  "physics": {"timestep": 0.002, "gravity": [0, 0, -9.81]},
+  "environment": {"ground": true, "light": true},
   "models": [
     {
       "id": "robot_1",
@@ -97,11 +109,31 @@ A scene is the stable editor/API contract. It places reusable model assets and d
 }
 ```
 
-`model_path` remains optional for compatibility with a legacy complete base MJCF. New scenes should use registered `model_id + version`; direct `source` remains supported for development. Omitting version resolves the latest registered version, while production scenes should pin it explicitly.
+The scene owns its world: the compiler always generates the MJCF skeleton from the scene
+itself — `physics` (`timestep`, `gravity`; MuJoCo defaults when omitted) becomes the
+`<option>` element, and `environment` (`ground`, `light`; both default true) generates a
+standard ground plane (`scene_ground`) and top light (`scene_top_light`). The legacy
+scene-level `model_path` (base MJCF file) has been removed and is rejected by validation;
+the only file-based path left is the instance-level `model_path` debug shortcut, which
+bypasses scenes entirely.
 
-RPC modules: `scene.load`, `scene.unload`, `scene.update`, `scene.apply`, `scene.list`, `scene.info`, `scene.validate`, `scene.diff`, `scene.compile`, `scene.export`.
+Every `models[]` entry must reference a registered asset by `model_id` (+ optional
+`version`); direct `source` file references are no longer accepted — validation rejects
+entries without a `model_id`, and `source` is purely the internal field the registry
+fills in during `resolve_scene`. Omitting version resolves the latest registered version,
+while production scenes should pin it explicitly.
 
-Structural changes are `model_path`, `models`, `objects`, `sensors`, and `contacts`; they require recompilation and instance recreation. `defaults` changes can be applied at runtime.
+RPC modules: `scene.load`, `scene.create`, `scene.save`, `scene.unload`, `scene.update`,
+`scene.apply`, `scene.list`, `scene.info`, `scene.validate`, `scene.diff`, `scene.compile`,
+`scene.export`.
+
+`scene.create` builds an empty (or seeded) scene in memory with no backing file, so the
+whole lifecycle can run from the editor UI; `scene.save` persists a loaded scene back to
+JSON on disk (its source `path` by default, else `build/scenes/<id>.json`, written
+atomically via temp-file rename). In-memory edits (`scene.update`) are lost on restart
+unless saved.
+
+Structural changes are `physics`, `environment`, `models`, `objects`, `sensors`, and `contacts`; they require recompilation and instance recreation. `defaults` changes can be applied at runtime.
 
 ## 3. Compiled Model
 
@@ -116,9 +148,17 @@ Structural changes are `model_path`, `models`, `objects`, `sensors`, and `contac
 
 The result contains `compiled_model_id`, generated model path, model sizes, initial state, and mapping tables. Runtime-only defaults do not change the structural model id.
 
+Pass `include_visual: true` (plus optional `include_geometry`, default true) to embed a
+`visual` payload in the result: the same geometry/site/model-count JSON that
+`visual.model` returns for an instance, extracted from the cached compiled `mjModel` via a
+temporary forwarded `mjData`. This lets the editor render real compiled geometry while
+composing a scene, before any instance exists (`simulation_visual_json` in
+`simulation_visual.cpp` is the shared extractor).
+
 The structural model id is a content-addressed SHA-256 of the structural signature plus each source file's timestamp, so distinct scenes cannot collide onto the same cached `mjModel`, and editing a source file transparently forces a recompile.
 
-Legacy `objects` entries of type `model.include` remain supported for body-level MJCF fragments, but new full model assets should use the `models` array.
+The legacy `model.include` object type has been removed; model composition goes through
+registered assets in the `models` array only.
 
 ### Scene export
 
@@ -137,7 +177,7 @@ Two `mode`s are available via the `flatten` flag:
 
 - **`flatten: false` — modular `<attach>` bundle, requires MuJoCo 3.2+.** Each registered model's package is copied in full under `assets/<i>_<id>/`, and `scene.xml` references them with `<model file="assets/…">` + `<attach>`. This preserves the modular structure but only loads in MuJoCo 3.2 or newer.
 
-In both modes a legacy base `model_path` scene or a `model.include` object embeds external content that is not relocated (reported under `warnings`). The modular mode additionally carries whatever the registration snapshot root captured, so for a clean bundle register production models against their own description-package directory (or a tight `asset_root`); the flattened mode is unaffected because it copies only referenced assets.
+Since the skeleton is generated and every mechanism comes from a registered asset package, exports are always self-contained. The modular mode carries whatever the registration snapshot root captured, so for a lean bundle register production models against their own description-package directory (or a tight `asset_root`); the flattened mode copies only referenced assets.
 
 ## 4. Runtime Instance
 
@@ -197,6 +237,9 @@ from its locked `mjData`.
 
 - The default `include_geometry: true` response includes primitive sizes, mesh vertices and
   triangle faces, height-field samples, material RGBA, and current `geom_xpos/geom_xmat`.
+- Every response (and `scene.compile` results, names only) carries `sites`: site names with
+  live world positions, used by the editor for the scene-sensor site dropdown and to render
+  sensor markers at their true locations.
 - `include_geometry: false` omits static mesh and height-field payloads and returns only
   current geom transforms plus instance time/status. This is the real-time preview path.
 - The browser loads full geometry once after instance creation, keys render objects by

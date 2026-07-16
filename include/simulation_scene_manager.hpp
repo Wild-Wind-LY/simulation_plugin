@@ -8,6 +8,13 @@
 class SimulationSceneManager {
 public:
   nlohmann::json load(const nlohmann::json& data);
+  // Create an empty (or seeded) scene in memory without a backing file.
+  // Fields: id (required), replace (default false), and optional scene content
+  // (name/model_path/models/objects/sensors/contacts/defaults or a full `scene`).
+  nlohmann::json create(const nlohmann::json& data);
+  // Persist a loaded scene to disk as JSON. Fields: id (required), path
+  // (optional; defaults to the scene's source path, else build/scenes/<id>.json).
+  nlohmann::json save(const nlohmann::json& data);
   nlohmann::json unload(const nlohmann::json& data);
   nlohmann::json update(const nlohmann::json& data);
   nlohmann::json list() const;
