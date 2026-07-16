@@ -182,6 +182,58 @@ int main() {
         return 1;
       }
     }
+    // 环境全景：介质/求解器/多灯/棋盘格地面/天空盒 -> 编译进 mjModel
+    {
+      const auto env_scene = nlohmann::json{
+          {"id", "env_scene"},
+          {"physics",
+           {{"timestep", 0.002},
+            {"gravity", {0, 0, -9.81}},
+            {"wind", {0.5, 0.0, 0.0}},
+            {"density", 1.2},
+            {"viscosity", 0.00002},
+            {"integrator", "implicitfast"},
+            {"solver", "newton"}}},
+          {"environment",
+           {{"ground",
+             {{"checker", true}, {"size", 8.0}, {"reflectance", 0.2}, {"friction", 1.0}}},
+            {"skybox", true},
+            {"lights",
+             nlohmann::json::array(
+                 {{{"pos", {0, 0, 4}}, {"directional", true}, {"castshadow", true}},
+                  {{"pos", {2, 2, 3}},
+                   {"dir", {-0.5, -0.5, -1}},
+                   {"directional", false},
+                   {"diffuse", {0.4, 0.4, 0.5}}}})}}},
+          {"models", nlohmann::json::array()},
+          {"defaults", nlohmann::json::object()},
+      };
+      if (!compiler.validate_scene(env_scene).value("valid", false)) {
+        std::cerr << "environment scene validation failed\n";
+        return 1;
+      }
+      auto env_compiled = compiler.compile_scene(env_scene);
+      auto env_model = compiler.get_compiled_model(env_compiled.value("compiled_model_id", ""));
+      if (!env_model) {
+        std::cerr << "environment scene compile failed\n";
+        return 1;
+      }
+      const int ground_id = mj_name2id(env_model.get(), mjOBJ_GEOM, "scene_ground");
+      if (env_model->opt.wind[0] != 0.5 || env_model->opt.density != 1.2
+          || env_model->opt.integrator != mjINT_IMPLICITFAST
+          || env_model->opt.solver != mjSOL_NEWTON || env_model->nlight != 2
+          || env_model->ntex < 2 /* skybox + checker */ || ground_id < 0
+          || env_model->geom_size[3 * ground_id] != 8.0) {
+        std::cerr << "environment scene model attributes mismatch\n";
+        return 1;
+      }
+      auto bad_scene = env_scene;
+      bad_scene["physics"]["integrator"] = "bogus";
+      if (compiler.validate_scene(bad_scene).value("valid", false)) {
+        std::cerr << "environment scene invalid integrator not rejected\n";
+        return 1;
+      }
+    }
     // 场景模型只允许注册资产引用：编译/校验前都必须经过注册表解析
     auto resolved_scene = reloaded_registry.resolve_scene(scene);
     auto validation = compiler.validate_scene(resolved_scene);

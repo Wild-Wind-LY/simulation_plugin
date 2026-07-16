@@ -48,6 +48,52 @@ namespace {
     issues.push_back({{"path", path}, {"message", message}});
   }
 
+  // ---------------- 环境全景：schema 归一化与取值映射 ----------------
+
+  // ground: 缺省/true -> 空对象（默认地面）；false -> null（不生成）；对象 -> 原样
+  nlohmann::json ground_config(const nlohmann::json& environment) {
+    if (!environment.contains("ground")) return nlohmann::json::object();
+    const auto& ground = environment["ground"];
+    if (ground.is_boolean())
+      return ground.get<bool>() ? nlohmann::json::object() : nlohmann::json();
+    if (ground.is_object()) return ground;
+    return nlohmann::json::object();
+  }
+
+  // lights 数组优先；否则退回旧式 light 布尔简写（true -> 一盏默认顶光）
+  nlohmann::json scene_lights(const nlohmann::json& environment) {
+    if (environment.contains("lights") && environment["lights"].is_array())
+      return environment["lights"];
+    if (environment.value("light", true)) {
+      return nlohmann::json::array(
+          {{{"pos", {0, 0, 3}}, {"dir", {0, 0, -1}}, {"directional", true}}});
+    }
+    return nlohmann::json::array();
+  }
+
+  bool skybox_enabled(const nlohmann::json& environment) {
+    if (!environment.contains("skybox")) return false;
+    const auto& skybox = environment["skybox"];
+    return skybox.is_object() || (skybox.is_boolean() && skybox.get<bool>());
+  }
+
+  std::optional<std::string> canonical_integrator(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+    if (value == "euler") return std::string{"Euler"};
+    if (value == "rk4") return std::string{"RK4"};
+    if (value == "implicit") return std::string{"implicit"};
+    if (value == "implicitfast") return std::string{"implicitfast"};
+    return std::nullopt;
+  }
+
+  std::optional<std::string> canonical_solver(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+    if (value == "pgs") return std::string{"PGS"};
+    if (value == "cg") return std::string{"CG"};
+    if (value == "newton") return std::string{"Newton"};
+    return std::nullopt;
+  }
+
   nlohmann::json structural_signature(const nlohmann::json& scene) {
     return {
         {"physics", scene.value("physics", nlohmann::json::object())},
@@ -85,6 +131,12 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
               "scene model_path is no longer supported; register the base model as an asset and "
               "reference it in models[], and use scene physics/environment for globals");
   }
+  const auto check_vec = [&errors](const nlohmann::json& parent, const char* key,
+                                   const std::string& path, size_t count) {
+    if (parent.contains(key) && (!parent[key].is_array() || parent[key].size() != count))
+      add_issue(errors, path + "." + key,
+                std::string(key) + " must be an array of " + std::to_string(count) + " numbers");
+  };
   if (scene.contains("physics") && !scene["physics"].is_object()) {
     add_issue(errors, "$.physics", "physics must be an object");
   } else if (scene.contains("physics")) {
@@ -92,12 +144,76 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
     if (physics.contains("timestep")
         && (!physics["timestep"].is_number() || physics["timestep"].get<double>() <= 0.0))
       add_issue(errors, "$.physics.timestep", "physics.timestep must be a positive number");
-    if (physics.contains("gravity")
-        && (!physics["gravity"].is_array() || physics["gravity"].size() != 3))
-      add_issue(errors, "$.physics.gravity", "physics.gravity must be an array of 3 numbers");
+    check_vec(physics, "gravity", "$.physics", 3);
+    check_vec(physics, "wind", "$.physics", 3);
+    check_vec(physics, "magnetic", "$.physics", 3);
+    for (const char* key : {"density", "viscosity"}) {
+      if (physics.contains(key) && (!physics[key].is_number() || physics[key].get<double>() < 0.0))
+        add_issue(errors, std::string("$.physics.") + key,
+                  std::string(key) + " must be a non-negative number");
+    }
+    if (physics.contains("integrator")
+        && (!physics["integrator"].is_string()
+            || !canonical_integrator(physics.value("integrator", ""))))
+      add_issue(errors, "$.physics.integrator",
+                "integrator must be one of: euler, rk4, implicit, implicitfast");
+    if (physics.contains("solver")
+        && (!physics["solver"].is_string() || !canonical_solver(physics.value("solver", ""))))
+      add_issue(errors, "$.physics.solver", "solver must be one of: pgs, cg, newton");
+    if (physics.contains("iterations")
+        && (!physics["iterations"].is_number_integer() || physics["iterations"].get<int>() <= 0))
+      add_issue(errors, "$.physics.iterations", "iterations must be a positive integer");
   }
   if (scene.contains("environment") && !scene["environment"].is_object()) {
     add_issue(errors, "$.environment", "environment must be an object");
+  } else if (scene.contains("environment")) {
+    const auto& environment = scene["environment"];
+    if (environment.contains("ground") && !environment["ground"].is_boolean()
+        && !environment["ground"].is_object()) {
+      add_issue(errors, "$.environment.ground", "ground must be a boolean or an object");
+    } else if (environment.contains("ground") && environment["ground"].is_object()) {
+      const auto& ground = environment["ground"];
+      if (ground.contains("size")
+          && (!ground["size"].is_number() || ground["size"].get<double>() <= 0.0))
+        add_issue(errors, "$.environment.ground.size", "size must be a positive number");
+      if (ground.contains("reflectance")
+          && (!ground["reflectance"].is_number() || ground["reflectance"].get<double>() < 0.0
+              || ground["reflectance"].get<double>() > 1.0))
+        add_issue(errors, "$.environment.ground.reflectance",
+                  "reflectance must be a number in [0, 1]");
+      if (ground.contains("friction")
+          && (!ground["friction"].is_number() || ground["friction"].get<double>() <= 0.0))
+        add_issue(errors, "$.environment.ground.friction", "friction must be a positive number");
+      check_vec(ground, "rgba", "$.environment.ground", 4);
+      check_vec(ground, "rgb1", "$.environment.ground", 3);
+      check_vec(ground, "rgb2", "$.environment.ground", 3);
+    }
+    if (environment.contains("skybox") && !environment["skybox"].is_boolean()
+        && !environment["skybox"].is_object()) {
+      add_issue(errors, "$.environment.skybox", "skybox must be a boolean or an object");
+    } else if (environment.contains("skybox") && environment["skybox"].is_object()) {
+      check_vec(environment["skybox"], "rgb1", "$.environment.skybox", 3);
+      check_vec(environment["skybox"], "rgb2", "$.environment.skybox", 3);
+    }
+    if (environment.contains("lights")) {
+      if (!environment["lights"].is_array()) {
+        add_issue(errors, "$.environment.lights", "lights must be an array");
+      } else {
+        for (size_t i = 0; i < environment["lights"].size(); ++i) {
+          const auto& light = environment["lights"][i];
+          const std::string path = "$.environment.lights[" + std::to_string(i) + "]";
+          if (!light.is_object()) {
+            add_issue(errors, path, "light must be an object");
+            continue;
+          }
+          check_vec(light, "pos", path, 3);
+          check_vec(light, "dir", path, 3);
+          check_vec(light, "diffuse", path, 3);
+          check_vec(light, "ambient", path, 3);
+          check_vec(light, "specular", path, 3);
+        }
+      }
+    }
   }
 
   std::set<std::string> ids;
@@ -745,17 +861,106 @@ std::string SimulationCompiler::generate_scene_xml(
     const auto environment = scene.value("environment", nlohmann::json::object());
     std::ostringstream skeleton;
     skeleton << "<mujoco model=\"" << xml_escape(scene.value("id", "scene")) << "\">\n";
+
+    // ---- <option>：物理介质与求解器 ----
     skeleton << "  <option timestep=\"" << physics.value("timestep", 0.002) << "\" gravity=\""
              << numeric_list(physics.value("gravity", nlohmann::json::array()), "0 0 -9.81", 3)
-             << "\"/>\n";
-    skeleton << "  <worldbody>\n";
-    if (environment.value("light", true)) {
-      skeleton << "    <light name=\"scene_top_light\" pos=\"0 0 3\" dir=\"0 0 -1\" "
-                  "directional=\"true\"/>\n";
+             << "\"";
+    if (physics.contains("wind"))
+      skeleton << " wind=\"" << numeric_list(physics["wind"], "0 0 0", 3) << "\"";
+    if (physics.contains("magnetic"))
+      skeleton << " magnetic=\"" << numeric_list(physics["magnetic"], "0 -0.5 0", 3) << "\"";
+    if (physics.contains("density") && physics["density"].is_number())
+      skeleton << " density=\"" << physics["density"].get<double>() << "\"";
+    if (physics.contains("viscosity") && physics["viscosity"].is_number())
+      skeleton << " viscosity=\"" << physics["viscosity"].get<double>() << "\"";
+    if (const auto integrator = canonical_integrator(physics.value("integrator", "")))
+      skeleton << " integrator=\"" << *integrator << "\"";
+    if (const auto solver = canonical_solver(physics.value("solver", "")))
+      skeleton << " solver=\"" << *solver << "\"";
+    if (physics.contains("iterations") && physics["iterations"].is_number_integer())
+      skeleton << " iterations=\"" << physics["iterations"].get<int>() << "\"";
+    skeleton << "/>\n";
+
+    // ---- <asset>：天空盒 / 棋盘格地面材质 ----
+    const nlohmann::json ground = ground_config(environment);
+    const bool ground_on = !ground.is_null();
+    const bool ground_checker = ground_on && ground.value("checker", false);
+    const double ground_reflectance = ground_on ? ground.value("reflectance", 0.0) : 0.0;
+    const bool ground_material = ground_checker || ground_reflectance > 0.0;
+    const double ground_size = ground_on ? std::max(0.1, ground.value("size", 5.0)) : 5.0;
+    std::ostringstream env_assets;
+    if (skybox_enabled(environment)) {
+      const nlohmann::json skybox
+          = environment["skybox"].is_object() ? environment["skybox"] : nlohmann::json::object();
+      env_assets << "    <texture name=\"scene_skybox\" type=\"skybox\" builtin=\"gradient\" "
+                    "rgb1=\""
+                 << numeric_list(skybox.value("rgb1", nlohmann::json::array()), "0.45 0.62 0.82", 3)
+                 << "\" rgb2=\""
+                 << numeric_list(skybox.value("rgb2", nlohmann::json::array()), "0.9 0.94 0.99", 3)
+                 << "\" width=\"512\" height=\"3072\"/>\n";
     }
-    if (environment.value("ground", true)) {
-      skeleton << "    <geom name=\"scene_ground\" type=\"plane\" size=\"5 5 0.1\" "
-                  "rgba=\"0.35 0.4 0.45 1\"/>\n";
+    if (ground_checker) {
+      env_assets << "    <texture name=\"scene_ground_tex\" type=\"2d\" builtin=\"checker\" "
+                    "rgb1=\""
+                 << numeric_list(ground.value("rgb1", nlohmann::json::array()), "0.2 0.25 0.3", 3)
+                 << "\" rgb2=\""
+                 << numeric_list(ground.value("rgb2", nlohmann::json::array()), "0.32 0.38 0.45", 3)
+                 << "\" width=\"300\" height=\"300\" mark=\"edge\" markrgb=\"0.85 0.85 0.85\"/>\n";
+    }
+    if (ground_material) {
+      env_assets << "    <material name=\"scene_ground_mat\"";
+      if (ground_checker) {
+        env_assets << " texture=\"scene_ground_tex\" texrepeat=\"" << ground_size << " "
+                   << ground_size << "\" texuniform=\"true\"";
+      } else {
+        env_assets << " rgba=\""
+                   << numeric_list(ground.value("rgba", nlohmann::json::array()), "0.35 0.4 0.45 1",
+                                   4)
+                   << "\"";
+      }
+      if (ground_reflectance > 0.0) env_assets << " reflectance=\"" << ground_reflectance << "\"";
+      env_assets << "/>\n";
+    }
+    const std::string env_asset_xml = env_assets.str();
+    if (!env_asset_xml.empty()) skeleton << "  <asset>\n" << env_asset_xml << "  </asset>\n";
+
+    // ---- <worldbody>：灯光与地面 ----
+    skeleton << "  <worldbody>\n";
+    int light_index = 0;
+    for (const auto& light : scene_lights(environment)) {
+      if (!light.is_object()) continue;
+      skeleton << "    <light name=\"scene_light_" << light_index << "\" pos=\""
+               << numeric_list(light.value("pos", nlohmann::json::array()), "0 0 3", 3)
+               << "\" dir=\""
+               << numeric_list(light.value("dir", nlohmann::json::array()), "0 0 -1", 3)
+               << "\" directional=\"" << (light.value("directional", true) ? "true" : "false")
+               << "\"";
+      if (light.contains("diffuse"))
+        skeleton << " diffuse=\"" << numeric_list(light["diffuse"], "0.8 0.8 0.8", 3) << "\"";
+      if (light.contains("ambient"))
+        skeleton << " ambient=\"" << numeric_list(light["ambient"], "0 0 0", 3) << "\"";
+      if (light.contains("specular"))
+        skeleton << " specular=\"" << numeric_list(light["specular"], "0.3 0.3 0.3", 3) << "\"";
+      if (light.contains("castshadow"))
+        skeleton << " castshadow=\"" << (light.value("castshadow", true) ? "true" : "false")
+                 << "\"";
+      skeleton << "/>\n";
+      ++light_index;
+    }
+    if (ground_on) {
+      skeleton << "    <geom name=\"scene_ground\" type=\"plane\" size=\"" << ground_size << " "
+               << ground_size << " 0.1\"";
+      if (ground_material)
+        skeleton << " material=\"scene_ground_mat\"";
+      else
+        skeleton << " rgba=\""
+                 << numeric_list(ground.value("rgba", nlohmann::json::array()), "0.35 0.4 0.45 1",
+                                 4)
+                 << "\"";
+      if (ground.contains("friction") && ground["friction"].is_number())
+        skeleton << " friction=\"" << ground["friction"].get<double>() << " 0.005 0.0001\"";
+      skeleton << "/>\n";
     }
     skeleton << "  </worldbody>\n</mujoco>\n";
     xml = skeleton.str();

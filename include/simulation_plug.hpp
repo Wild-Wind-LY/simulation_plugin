@@ -1,9 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -22,6 +24,10 @@ public:
   explicit SimulationPlug() = default;
   ~SimulationPlug() override = default;
 
+#ifdef SIMULATION_PLUGIN_TEST_ACCESS
+  void test_publish_state(const nlohmann::json& state) noexcept { publish_state(state); }
+#endif
+
 private:
   bool on_init(IPluginContext& ctx) noexcept override;
   bool on_start() noexcept override;
@@ -35,6 +41,12 @@ private:
                          PluginWsMessageType type);
   void handle_ws_open(const char* session_id);
   void handle_ws_close(const char* session_id);
+  bool send_ws_text_checked(const char* session_id, std::string_view text) noexcept;
+  bool send_ws_latest_text_checked(const char* session_id, const char* topic,
+                                   std::string_view text) noexcept;
+  void note_ws_send_failure(const char* operation, const char* session_id,
+                            PluginWsSendResult result, size_t bytes,
+                            const char* topic = nullptr) noexcept;
 
   JsonRpcResult handle_scene_load(const nlohmann::json& data);
   JsonRpcResult handle_scene_create(const nlohmann::json& data);
@@ -98,6 +110,7 @@ private:
   std::shared_ptr<const JsonRpcRouter::RouteMap> routes_;
   std::mutex ws_mutex_;
   std::unordered_map<std::string, WsSubscription> ws_subscriptions_;
+  std::atomic_uint64_t ws_send_failures_{0};
   SimulationSceneManager scenes_;
   SimulationModelRegistry model_registry_;
   SimulationCompiler compiler_;

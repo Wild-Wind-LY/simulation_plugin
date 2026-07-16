@@ -133,12 +133,26 @@ A scene is the stable editor/API contract. It places reusable model assets and d
 ```
 
 The scene owns its world: the compiler always generates the MJCF skeleton from the scene
-itself — `physics` (`timestep`, `gravity`; MuJoCo defaults when omitted) becomes the
-`<option>` element, and `environment` (`ground`, `light`; both default true) generates a
-standard ground plane (`scene_ground`) and top light (`scene_top_light`). The legacy
-scene-level `model_path` (base MJCF file) has been removed and is rejected by validation;
-the only file-based path left is the instance-level `model_path` debug shortcut, which
-bypasses scenes entirely.
+itself. `physics` maps to `<option>` and covers the full MuJoCo medium/solver surface:
+`timestep`, `gravity`, `wind` (3-vector), `density` + `viscosity` (medium presets: 0/0
+vacuum, 1.2/1.8e-5 air, 1000/9e-4 water), `magnetic`, `integrator` (`euler`/`rk4`/
+`implicit`/`implicitfast`, case-insensitive), `solver` (`pgs`/`cg`/`newton`), and
+`iterations`; only explicitly present keys are emitted, so MuJoCo defaults apply otherwise.
+
+`environment` generates world assets and worldbody entries:
+
+- `ground`: `true` (default plain plane, the default) / `false` / object
+  `{size, checker, rgb1, rgb2, rgba, reflectance, friction}`. `checker` emits a builtin
+  checker texture + material (`scene_ground_mat`); `reflectance` also routes through the
+  material; `friction` sets the plane's sliding friction. The geom is named `scene_ground`.
+- `lights`: array of `{pos, dir, directional, diffuse, ambient, specular, castshadow}`,
+  emitted as `scene_light_<i>`. The legacy boolean `light: true` shorthand still produces
+  one default top light when `lights` is absent.
+- `skybox`: `true` or `{rgb1, rgb2}` — builtin gradient skybox texture.
+
+The legacy scene-level `model_path` (base MJCF file) has been removed and is rejected by
+validation; the only file-based path left is the instance-level `model_path` debug
+shortcut, which bypasses scenes entirely.
 
 Every `models[]` entry must reference a registered asset by `model_id` (+ optional
 `version`); direct `source` file references are no longer accepted — validation rejects

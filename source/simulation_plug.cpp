@@ -928,7 +928,7 @@ void SimulationPlug::handle_ws_open(const char* session_id) {
       {"endpoint", "simulation"},
       {"usage",
        R"(send {"action":"subscribe","instances":["<id>"],"visual":true}; ["*"] subscribes all; visual attaches geom poses)"}};
-  ws_send_text(session_id, hello.dump());
+  send_ws_text_checked(session_id, hello.dump());
 }
 
 void SimulationPlug::handle_ws_close(const char* session_id) {
@@ -941,7 +941,7 @@ void SimulationPlug::handle_ws_message(const char* session_id, const void* data,
                                        PluginWsMessageType type) {
   if (!session_id || type != PluginWsMessageType::Text) return;
 
-  const auto reply = [&](const nlohmann::json& j) { ws_send_text(session_id, j.dump()); };
+  const auto reply = [&](const nlohmann::json& j) { send_ws_text_checked(session_id, j.dump()); };
 
   nlohmann::json msg;
   try {
@@ -1083,7 +1083,7 @@ void SimulationPlug::publish_state(const nlohmann::json& state) noexcept {
     if (!plain_targets.empty()) {
       const std::string text = event.dump();
       for (const auto& session_id : plain_targets)
-        ws_send_latest_text(session_id.c_str(), topic.c_str(), text);
+        send_ws_latest_text_checked(session_id.c_str(), topic.c_str(), text);
     }
     if (!visual_targets.empty()) {
       // 附带 geom 世界位姿（transforms-only），浏览器端按 geom_id 增量更新 3D 预览。
@@ -1096,12 +1096,53 @@ void SimulationPlug::publish_state(const nlohmann::json& state) noexcept {
       }
       const std::string text = event.dump();
       for (const auto& session_id : visual_targets)
-        ws_send_latest_text(session_id.c_str(), topic.c_str(), text);
+        send_ws_latest_text_checked(session_id.c_str(), topic.c_str(), text);
     }
   } catch (const std::exception& e) {
     LOG_ERROR("[{}] publish_state failed: {}", TAG, e.what());
   } catch (...) {
     LOG_ERROR("[{}] publish_state unknown failure", TAG);
+  }
+}
+
+bool SimulationPlug::send_ws_text_checked(const char* session_id, std::string_view text) noexcept {
+  const auto result = ws_send_text_result(session_id, text);
+  if (result == PluginWsSendResult::Queued) return true;
+  note_ws_send_failure("send_text", session_id, result, text.size());
+  return false;
+}
+
+bool SimulationPlug::send_ws_latest_text_checked(const char* session_id, const char* topic,
+                                                 std::string_view text) noexcept {
+  const auto result = ws_send_latest_text_result(session_id, topic, text);
+  if (result == PluginWsSendResult::Queued) return true;
+  note_ws_send_failure("send_latest_text", session_id, result, text.size(), topic);
+  return false;
+}
+
+void SimulationPlug::note_ws_send_failure(const char* operation, const char* session_id,
+                                          PluginWsSendResult result, size_t bytes,
+                                          const char* topic) noexcept {
+  if (session_id
+      && (result == PluginWsSendResult::SessionClosed
+          || result == PluginWsSendResult::SessionNotFound)) {
+    std::lock_guard<std::mutex> lock(ws_mutex_);
+    ws_subscriptions_.erase(session_id);
+  }
+
+  const uint64_t failures = ws_send_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
+  // 1,2,4,8... 次时记录，既能看到持续失败，又避免高频状态发送刷日志。
+  if ((failures & (failures - 1)) == 0) {
+    if (topic && topic[0] != '\0') {
+      LOG_WARN(
+          "[{}] WS {} failed: result={}, session={}, topic={}, bytes={}, total_failures={}", TAG,
+          operation ? operation : "send", plugin_ws_send_result_name(result),
+          session_id ? session_id : "", topic, bytes, failures);
+    } else {
+      LOG_WARN("[{}] WS {} failed: result={}, session={}, bytes={}, total_failures={}", TAG,
+               operation ? operation : "send", plugin_ws_send_result_name(result),
+               session_id ? session_id : "", bytes, failures);
+    }
   }
 }
 

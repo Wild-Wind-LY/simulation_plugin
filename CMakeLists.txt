@@ -78,3 +78,16 @@ target_link_libraries(simulation_manager_smoke PRIVATE
 )
 
 add_test(NAME simulation_manager_smoke COMMAND simulation_manager_smoke)
+
+add_executable(simulation_ws_integration
+  tests/simulation_ws_integration.cpp
+  ${sources}
+)
+target_compile_definitions(simulation_ws_integration PRIVATE
+  PLUGIN_LOG_NAME=SimulationPluginWsTest
+  SIMULATION_PLUGIN_TEST_ACCESS=1
+)
+target_link_libraries(simulation_ws_integration PRIVATE
+  nlohmann_json xplugin::sdk mujoco::mujoco Threads::Threads
+)
+add_test(NAME simulation_ws_integration COMMAND simulation_ws_integration)
