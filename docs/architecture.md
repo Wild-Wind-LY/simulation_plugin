@@ -30,6 +30,29 @@ RPC into the simulation runtime, re-add `register_json_service` over the same ro
   The internal event-bus topic `simulation.instance.<id>.state` is still published for
   in-process subscribers.
 
+## Data directory
+
+All plugin-owned files live under one data root — `<gateway cwd>/simulation_data` by
+default, relocatable via the `SIMULATION_DATA_DIR` environment variable (absolute, or
+relative to the gateway working directory). Layout separates data by lifetime:
+
+```text
+simulation_data/
+  scenes/                  saved scene JSON            (durable — back this up)
+  model_assets/            asset registry + packages   (durable — back this up)
+  records/                 experiment JSONL            (durable — back this up)
+  exports/                 scene.export bundles        (semi-durable)
+  cache/generated_scenes/  compiled MJCF intermediates (safe to delete)
+  tmp/uploads/             model.upload staging        (transient)
+```
+
+Resolution goes through `simulation_paths.{hpp,cpp}`. On first access, if a directory is
+missing but the legacy `<cwd>/build/<name>` location exists, it is migrated automatically
+via rename; if the rename fails (cross-device), the legacy directory keeps being used so
+data is never lost. The historical layout put durable data under `build/`, which both
+collided with the "disposable build artifacts" convention and produced `build/build/...`
+paths when the gateway runs from a build directory.
+
 The plugin uses four primary concepts with explicit ownership boundaries:
 
 ```text
@@ -40,13 +63,13 @@ Model Asset -> Scene Configuration -> Compiled Model -> Runtime Instance
 
 A model asset is one reusable MJCF file describing a robot, tool, workpiece, fixture, or other mechanism. It owns its body tree, joints, actuators, sensors, defaults, and referenced mesh/texture assets. It does not own placement in a workcell.
 
-Assets are registered by stable `model_id + version`. Registry metadata is persisted in `build/model_assets/registry.json`. URDF assets are validated and converted to generated MJCF during registration so they can participate in MuJoCo `asset/model + attach` composition.
+Assets are registered by stable `model_id + version`. Registry metadata is persisted in `simulation_data/model_assets/registry.json`. URDF assets are validated and converted to generated MJCF during registration so they can participate in MuJoCo `asset/model + attach` composition.
 
 ### Registration semantics
 
 Registration is transactional and produces a self-contained, portable, integrity-checked asset:
 
-- **Self-contained packaging.** By default (`copy_assets: true`) the model and its neighbouring asset directory are snapshotted into `build/model_assets/<id>/<version>/`, preserving relative structure so `meshdir`, `include`, and mesh/texture references keep resolving. A registered version therefore survives moving or deleting the original source files. The snapshot root defaults to the model file's parent directory; pass `asset_root` to widen or narrow it (it must be an ancestor of the model file), and it is bounded by size (`max_asset_bytes`, default 1 GiB) and file-count caps to prevent accidentally copying an unrelated tree. Set `copy_assets: false` to keep referencing the original file in place (not portable; intended for development).
+- **Self-contained packaging.** By default (`copy_assets: true`) the model and its neighbouring asset directory are snapshotted into `simulation_data/model_assets/<id>/<version>/`, preserving relative structure so `meshdir`, `include`, and mesh/texture references keep resolving. A registered version therefore survives moving or deleting the original source files. The snapshot root defaults to the model file's parent directory; pass `asset_root` to widen or narrow it (it must be an ancestor of the model file), and it is bounded by size (`max_asset_bytes`, default 1 GiB) and file-count caps to prevent accidentally copying an unrelated tree. Set `copy_assets: false` to keep referencing the original file in place (not portable; intended for development).
 - **Portability.** The manifest stores paths relative to the storage root and hydrates them back to absolute paths on read, so a registry directory can be relocated between working directories or machines.
 - **Integrity.** SHA-256 digests are recorded at registration: the effective (compiled) model file, plus — for packaged assets — a whole-package digest covering every snapshotted file (meshes, textures, includes), so tampering with any asset is detectable, not just the top-level model. `model.verify` recomputes and compares (reporting `scope: package` or `model-file` on mismatch); `model.info` embeds the same status under `integrity`.
 - **Robot metadata.** The effective model is compiled during registration; the resulting entry carries `sizes`, a `controllable` flag (`nu > 0`), a joints/actuators/sensors `summary`, and `warnings` (e.g. no actuators, no joints). Pass `require_actuators: true` to reject a model that has no actuators.
@@ -59,7 +82,7 @@ RPC modules:
 - `model.upload` (HTTP only): browser-direct `multipart/form-data` upload. Form fields `id`,
   `version`, `replace`, `require_actuators`; file parts may carry relative sub-paths
   (sanitized against traversal) so meshes/textures keep resolving. Files are staged under
-  `build/model_uploads/<id>_<version>_<ts>/`, registered with `copy_assets: true` (the
+  `simulation_data/tmp/uploads/<id>_<version>_<ts>/`, registered with `copy_assets: true` (the
   registry snapshots them into its own storage), then the staging directory is removed.
   Endpoint accepts bodies up to 256 MiB; parts above 8 MiB stream through temp files.
 - `model.list`, `model.info`, `model.remove`: manage registered versions. Omitting `version` resolves the latest by semantic-version ordering (`1.10 > 1.9`). `model.remove` deletes the version's package directory.
@@ -129,9 +152,16 @@ RPC modules: `scene.load`, `scene.create`, `scene.save`, `scene.unload`, `scene.
 
 `scene.create` builds an empty (or seeded) scene in memory with no backing file, so the
 whole lifecycle can run from the editor UI; `scene.save` persists a loaded scene back to
-JSON on disk (its source `path` by default, else `build/scenes/<id>.json`, written
+JSON on disk (its source `path` by default, else `simulation_data/scenes/<id>.json`, written
 atomically via temp-file rename). In-memory edits (`scene.update`) are lost on restart
 unless saved.
+
+`scene.list` returns in-memory scenes with `loaded: true` and additionally scans the
+default `simulation_data/scenes/` directory for `*.json` files not currently loaded, listing them
+with `loaded: false` plus their `path` (id read from the file content, falling back to the
+filename stem; corrupt files are still listed by name). This is how the editor's scene
+dropdown survives gateway restarts: it shows saved-but-unloaded scenes and re-issues
+`scene.load {path}` when one is selected. Memory entries win id collisions.
 
 Structural changes are `physics`, `environment`, `models`, `objects`, `sensors`, and `contacts`; they require recompilation and instance recreation. `defaults` changes can be applied at runtime.
 
@@ -162,7 +192,7 @@ registered assets in the `models` array only.
 
 ### Scene export
 
-`scene.export` emits a **self-contained, relocatable MJCF bundle** that opens directly in MuJoCo `simulate` (or any MJCF tool) on any machine. The export is always verified by loading the written `scene.xml` standalone before returning, and the result includes `model_file`, an `open_with` (`simulate "<path>"`) hint, model sizes, `mode`, `min_mujoco`, `self_contained`, and any `warnings`. `out_dir` defaults to `build/scene_exports/<scene_id>`.
+`scene.export` emits a **self-contained, relocatable MJCF bundle** that opens directly in MuJoCo `simulate` (or any MJCF tool) on any machine. The export is always verified by loading the written `scene.xml` standalone before returning, and the result includes `model_file`, an `open_with` (`simulate "<path>"`) hint, model sizes, `mode`, `min_mujoco`, `self_contained`, and any `warnings`. `out_dir` defaults to `simulation_data/exports/<scene_id>`.
 
 Two `mode`s are available via the `flatten` flag:
 

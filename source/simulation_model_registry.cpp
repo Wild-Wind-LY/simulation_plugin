@@ -1,17 +1,20 @@
-#include "simulation_hash.hpp"
 #include "simulation_model_registry.hpp"
-#include "simulation_mujoco_utils.hpp"
+
+#include <mujoco/mujoco.h>
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
-#include <mujoco/mujoco.h>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
+
+#include "simulation_hash.hpp"
+#include "simulation_mujoco_utils.hpp"
+#include "simulation_paths.hpp"
 
 namespace {
 
@@ -90,8 +93,7 @@ namespace {
   // Inspect a compiled model and report robot-relevant metadata / warnings.
   nlohmann::json inspect_compiled_model(const mjModel* model, const std::string& format) {
     nlohmann::json warnings = nlohmann::json::array();
-    if (model->nu == 0)
-      warnings.push_back("model has no actuators; ctrl commands cannot move it");
+    if (model->nu == 0) warnings.push_back("model has no actuators; ctrl commands cannot move it");
     if (model->njnt == 0) warnings.push_back("model has no joints");
     if (model->nsensor == 0) warnings.push_back("model has no sensors");
     if (format == "urdf" && model->nu == 0)
@@ -132,11 +134,13 @@ nlohmann::json SimulationModelRegistry::register_model(const nlohmann::json& dat
       = data.value("max_asset_bytes", static_cast<uint64_t>(1) << 30);  // 1 GiB default
 
   if (!safe_identifier(id))
-    throw std::invalid_argument("model 'id' may only contain letters, digits, '.', '_', '-' "
-                                "and must not be '.' or '..'");
+    throw std::invalid_argument(
+        "model 'id' may only contain letters, digits, '.', '_', '-' "
+        "and must not be '.' or '..'");
   if (!safe_identifier(version))
-    throw std::invalid_argument("model 'version' may only contain letters, digits, '.', '_', '-' "
-                                "and must not be '.' or '..'");
+    throw std::invalid_argument(
+        "model 'version' may only contain letters, digits, '.', '_', '-' "
+        "and must not be '.' or '..'");
   if (path_text.empty()) throw std::invalid_argument("missing model 'path'");
 
   const auto source = normalize_path(path_text);
@@ -342,7 +346,7 @@ nlohmann::json SimulationModelRegistry::resolve_scene(nlohmann::json scene) cons
 // ------------------------------ helpers ---------------------------------
 
 std::filesystem::path SimulationModelRegistry::default_storage_dir() {
-  return std::filesystem::current_path() / "build" / "model_assets";
+  return simulation_data_dir("model_assets", "model_assets");
 }
 
 std::string SimulationModelRegistry::key(const std::string& id, const std::string& version) {
@@ -406,8 +410,8 @@ std::filesystem::path SimulationModelRegistry::snapshot_package(
   uint64_t total_bytes = 0;
   uint64_t file_count = 0;
   constexpr uint64_t kMaxFiles = 50000;
-  for (auto it = fs::recursive_directory_iterator(
-           root, fs::directory_options::skip_permission_denied);
+  for (auto it
+       = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied);
        it != fs::recursive_directory_iterator(); ++it) {
     const auto& entry = *it;
     if (entry.is_directory() && is_ignored_dir_name(entry.path().filename().string())) {
@@ -431,8 +435,8 @@ std::filesystem::path SimulationModelRegistry::snapshot_package(
   // Copy preserving the relative structure so meshdir/include references keep
   // resolving inside the package.
   fs::create_directories(pkg_dir);
-  for (auto it = fs::recursive_directory_iterator(
-           root, fs::directory_options::skip_permission_denied);
+  for (auto it
+       = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied);
        it != fs::recursive_directory_iterator(); ++it) {
     const auto& entry = *it;
     if (entry.is_directory() && is_ignored_dir_name(entry.path().filename().string())) {
@@ -448,8 +452,9 @@ std::filesystem::path SimulationModelRegistry::snapshot_package(
     } else if (entry.is_regular_file()) {
       fs::create_directories(dest.parent_path(), ec);
       fs::copy_file(entry.path(), dest, fs::copy_options::overwrite_existing, ec);
-      if (ec) throw std::runtime_error("failed to copy asset " + entry.path().string() + ": "
-                                       + ec.message());
+      if (ec)
+        throw std::runtime_error("failed to copy asset " + entry.path().string() + ": "
+                                 + ec.message());
     }
   }
   return pkg_dir;
@@ -558,8 +563,7 @@ void SimulationModelRegistry::load_manifest() {
   const nlohmann::json* models = nullptr;
   if (manifest.is_array()) {
     models = &manifest;  // legacy schema: a bare array of entries
-  } else if (manifest.is_object() && manifest.contains("models")
-             && manifest["models"].is_array()) {
+  } else if (manifest.is_object() && manifest.contains("models") && manifest["models"].is_array()) {
     models = &manifest["models"];
   } else {
     return;  // unrecognised shape; treat as empty rather than throwing

@@ -2,7 +2,11 @@
 
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <stdexcept>
+#include <system_error>
+
+#include "simulation_paths.hpp"
 
 namespace {
 
@@ -80,7 +84,8 @@ nlohmann::json SimulationSceneManager::save(const nlohmann::json& data) {
     if (path_text.empty()) path_text = it->second.value("path", "");
     scene = it->second;
   }
-  if (path_text.empty()) path_text = "build/scenes/" + id + ".json";
+  if (path_text.empty())
+    path_text = (simulation_data_dir("scenes", "scenes") / (id + ".json")).string();
 
   const auto scene_path = normalize_path(path_text);
   std::error_code ec;
@@ -149,13 +154,57 @@ nlohmann::json SimulationSceneManager::unload(const nlohmann::json& data) {
 nlohmann::json SimulationSceneManager::list() const {
   std::lock_guard lock{mutex_};
   nlohmann::json out = nlohmann::json::array();
+  std::set<std::string> listed_ids;
+  std::set<std::string> listed_paths;
   for (const auto& [id, scene] : scenes_) {
     out.push_back({
         {"id", id},
         {"name", scene.value("name", id)},
         {"model_count", scene.value("models", nlohmann::json::array()).size()},
         {"path", scene.value("path", "")},
+        {"loaded", true},
     });
+    listed_ids.insert(id);
+    const std::string path = scene.value("path", "");
+    if (!path.empty()) listed_paths.insert(path);
+  }
+  // 默认场景目录里的 JSON 文件也列出来（loaded:false）：网关重启清空内存后，
+  // 编辑器仍能发现保存过的场景并按 path 重新 scene.load。
+  std::error_code ec;
+  const auto dir = simulation_data_dir("scenes", "scenes");
+  if (std::filesystem::is_directory(dir, ec)) {
+    try {
+      for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file(ec) || entry.path().extension() != ".json") continue;
+        const std::string path = std::filesystem::weakly_canonical(entry.path(), ec).string();
+        if (listed_paths.count(path)) continue;
+        std::string id = entry.path().stem().string();
+        std::string name = id;
+        size_t model_count = 0;
+        std::ifstream input(entry.path());
+        if (input) {
+          try {
+            const auto scene = nlohmann::json::parse(input);
+            if (!scene.value("id", "").empty()) id = scene["id"].get<std::string>();
+            name = scene.value("name", id);
+            model_count = scene.value("models", nlohmann::json::array()).size();
+          } catch (...) {
+            // 损坏的 JSON 仍按文件名列出，交给 scene.load 报具体错误
+          }
+        }
+        if (listed_ids.count(id)) continue;
+        out.push_back({
+            {"id", id},
+            {"name", name},
+            {"model_count", model_count},
+            {"path", path},
+            {"loaded", false},
+        });
+        listed_ids.insert(id);
+      }
+    } catch (const std::exception&) {
+      // 目录遍历失败不影响内存场景列表
+    }
   }
   return out;
 }

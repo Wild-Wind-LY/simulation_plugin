@@ -15,6 +15,7 @@
 
 #include "simulation_hash.hpp"
 #include "simulation_mujoco_utils.hpp"
+#include "simulation_paths.hpp"
 
 namespace {
 
@@ -586,11 +587,11 @@ SimulationCompiler::ModelPtr SimulationCompiler::load_model(const std::filesyste
 }
 
 std::filesystem::path SimulationCompiler::default_output_dir() {
-  return std::filesystem::current_path() / "build" / "generated_scenes";
+  return simulation_data_dir("cache/generated_scenes", "generated_scenes");
 }
 
 std::filesystem::path SimulationCompiler::default_export_dir() {
-  return std::filesystem::current_path() / "build" / "scene_exports";
+  return simulation_data_dir("exports", "scene_exports");
 }
 
 std::filesystem::path SimulationCompiler::resolve_scene_path(const nlohmann::json& scene,

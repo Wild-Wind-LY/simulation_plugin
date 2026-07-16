@@ -70,6 +70,7 @@ add_executable(simulation_manager_smoke
   source/simulation_record_manager.cpp
   source/simulation_model_validator.cpp
   source/simulation_model_registry.cpp
+  source/simulation_paths.cpp
   source/simulation_visual.cpp
 )
 target_link_libraries(simulation_manager_smoke PRIVATE

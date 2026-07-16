@@ -1,12 +1,15 @@
 ﻿#include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <system_error>
 #include <thread>
 
 #include "simulation_compiler.hpp"
 #include "simulation_instance_manager.hpp"
 #include "simulation_model_registry.hpp"
 #include "simulation_model_validator.hpp"
+#include "simulation_paths.hpp"
 #include "simulation_record_manager.hpp"
 #include "simulation_scene_manager.hpp"
 #include "simulation_task_manager.hpp"
@@ -25,6 +28,40 @@ int main() {
         || scenes.info({{"id", "falling_box_scene"}}).value("name", "") != "Falling Box Demo") {
       std::cerr << "scene list/info failed\n";
       return 1;
+    }
+    // scene.list 磁盘发现：保存到默认目录 -> 卸载 -> list 以 loaded:false 列出 -> 按 path 重载
+    {
+      const auto saved = scenes.save(
+          {{"id", "falling_box_scene"},
+           {"path", (simulation_data_dir("scenes", "scenes") / "__smoke_list__.json").string()}});
+      const std::string saved_path = saved.value("path", "");
+      scenes.unload({{"id", "falling_box_scene"}});
+      bool found_on_disk = false;
+      for (const auto& entry : scenes.list()) {
+        if (entry.value("id", "") == "falling_box_scene" && !entry.value("loaded", true)
+            && entry.value("path", "") == saved_path) {
+          found_on_disk = true;
+          break;
+        }
+      }
+      if (!found_on_disk) {
+        std::cerr << "scene list disk discovery failed\n";
+        return 1;
+      }
+      auto reloaded = scenes.load({{"path", saved_path}});
+      bool loaded_in_list = false;
+      for (const auto& entry : scenes.list()) {
+        if (entry.value("id", "") == "falling_box_scene" && entry.value("loaded", false)) {
+          loaded_in_list = true;
+          break;
+        }
+      }
+      if (reloaded.value("id", "") != "falling_box_scene" || !loaded_in_list) {
+        std::cerr << "scene list reload failed\n";
+        return 1;
+      }
+      std::error_code cleanup_ec;
+      std::filesystem::remove(saved_path, cleanup_ec);
     }
     scene = scenes.update(scene);
     if (!scenes.references_model("workpiece", "1") || scenes.references_model("workpiece", "2")) {

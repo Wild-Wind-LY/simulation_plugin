@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "simulation_paths.hpp"
+
 SimulationRecordManager::SimulationRecordManager(std::filesystem::path output_dir)
     : output_dir_(std::move(output_dir)) {}
 
@@ -104,7 +106,7 @@ void SimulationRecordManager::stop_all() noexcept {
 }
 
 std::filesystem::path SimulationRecordManager::default_output_dir() {
-  return std::filesystem::current_path() / "build" / "records";
+  return simulation_data_dir("records", "records");
 }
 
 std::string SimulationRecordManager::require_id(const nlohmann::json& data) {

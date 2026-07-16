@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "simulation_paths.hpp"
 #include "simulation_visual.hpp"
 
 bool SimulationPlug::on_init(IPluginContext& ctx) noexcept {
@@ -52,10 +53,11 @@ bool SimulationPlug::on_start() noexcept {
 
   // 实时状态推送：ws://<host>/backend/plugin-ws/simulation
   PluginWsEndpointOptions ws_options;
-  ws_options.max_message_size = 8 * 1024 * 1024;
-  ws_options.max_sessions = 128;
-  ws_options.max_send_queue_messages = 64;
-  ws_options.max_send_queue_bytes = 32 * 1024 * 1024;
+  ws_options.max_receive_message_size = 64 * 1024;
+  ws_options.max_send_message_size = 8 * 1024 * 1024;
+  ws_options.max_sessions = 32;
+  ws_options.max_send_queue_messages = 32;
+  ws_options.max_send_queue_bytes = 16 * 1024 * 1024;
   if (!register_ws_endpoint(
           "simulation",
           [this](const char* session_id, const void* data, size_t size, PluginWsMessageType type) {
@@ -852,7 +854,7 @@ PluginHttpResponse SimulationPlug::handle_model_upload(const PluginHttpRequest& 
                             std::chrono::system_clock::now().time_since_epoch())
                             .count();
     upload_dir
-        = fs::path("build") / "model_uploads"
+        = simulation_data_dir("tmp/uploads", "model_uploads")
           / (safe_dir_token(id) + "_" + safe_dir_token(version) + "_" + std::to_string(now_ms));
     fs::create_directories(upload_dir);
 
@@ -951,29 +953,70 @@ void SimulationPlug::handle_ws_message(const char* session_id, const void* data,
 
   try {
     const std::string action = msg.value("action", "");
+    constexpr size_t kMaxSubscriptions = 64;
+    constexpr size_t kMaxInstanceIdSize = 128;
 
     std::unordered_set<std::string> instances;
-    if (msg.contains("instances") && msg["instances"].is_array()) {
-      for (const auto& item : msg["instances"]) {
-        if (item.is_string()) instances.insert(item.get<std::string>());
+    if (msg.contains("instances")) {
+      if (!msg["instances"].is_array() || msg["instances"].size() > kMaxSubscriptions) {
+        reply({{"type", "error"}, {"message", "instances must be an array of at most 64 IDs"}});
+        return;
       }
-    } else if (msg.contains("instance") && msg["instance"].is_string()) {
-      instances.insert(msg["instance"].get<std::string>());
+      for (const auto& item : msg["instances"]) {
+        if (!item.is_string()) {
+          reply({{"type", "error"}, {"message", "instance IDs must be strings"}});
+          return;
+        }
+        const auto id = item.get<std::string>();
+        if (id.empty() || id.size() > kMaxInstanceIdSize) {
+          reply({{"type", "error"}, {"message", "instance ID length must be 1..128"}});
+          return;
+        }
+        instances.insert(id);
+      }
+    } else if (msg.contains("instance")) {
+      if (!msg["instance"].is_string()) {
+        reply({{"type", "error"}, {"message", "instance must be a string"}});
+        return;
+      }
+      const auto id = msg["instance"].get<std::string>();
+      if (id.empty() || id.size() > kMaxInstanceIdSize) {
+        reply({{"type", "error"}, {"message", "instance ID length must be 1..128"}});
+        return;
+      }
+      instances.insert(id);
     }
-    if (instances.empty()) instances.insert("*");
 
     if (action == "subscribe") {
+      if (instances.empty()) {
+        reply({{"type", "error"}, {"message", "subscribe requires instances"}});
+        return;
+      }
+      if (msg.contains("visual") && !msg["visual"].is_boolean()) {
+        reply({{"type", "error"}, {"message", "visual must be a boolean"}});
+        return;
+      }
       bool visual = false;
+      bool limit_exceeded = false;
       {
         std::lock_guard<std::mutex> lock(ws_mutex_);
-        auto& sub = ws_subscriptions_[session_id];
+        auto next = ws_subscriptions_[session_id];
         if (instances.count("*") != 0) {
-          sub.instances = {"*"};
-        } else {
-          sub.instances.insert(instances.begin(), instances.end());
+          next.instances = {"*"};
+        } else if (next.instances.count("*") == 0) {
+          next.instances.insert(instances.begin(), instances.end());
         }
-        if (msg.contains("visual")) sub.visual = msg.value("visual", false);
-        visual = sub.visual;
+        if (next.instances.size() > kMaxSubscriptions) {
+          limit_exceeded = true;
+        } else {
+          if (msg.contains("visual")) next.visual = msg.value("visual", false);
+          visual = next.visual;
+          ws_subscriptions_[session_id] = std::move(next);
+        }
+      }
+      if (limit_exceeded) {
+        reply({{"type", "error"}, {"message", "subscription limit exceeded"}});
+        return;
       }
       reply(
           {{"type", "ack"}, {"action", "subscribe"}, {"instances", instances}, {"visual", visual}});
@@ -981,6 +1024,10 @@ void SimulationPlug::handle_ws_message(const char* session_id, const void* data,
     }
 
     if (action == "unsubscribe") {
+      if (instances.empty()) {
+        reply({{"type", "error"}, {"message", "unsubscribe requires instances"}});
+        return;
+      }
       {
         std::lock_guard<std::mutex> lock(ws_mutex_);
         const auto it = ws_subscriptions_.find(session_id);
