@@ -22,7 +22,8 @@ namespace {
 
 }  // namespace
 
-nlohmann::json SimulationInstanceManager::create(const nlohmann::json& data, ModelPtr shared_model) {
+nlohmann::json SimulationInstanceManager::create(const nlohmann::json& data,
+                                                 ModelPtr shared_model) {
   const std::string model_path = normalize_model_path(data);
 
   std::string id = data.value("id", "");
@@ -58,7 +59,8 @@ nlohmann::json SimulationInstanceManager::create(const nlohmann::json& data, Mod
   return state;
 }
 
-nlohmann::json SimulationInstanceManager::recreate(const nlohmann::json& data, ModelPtr shared_model) {
+nlohmann::json SimulationInstanceManager::recreate(const nlohmann::json& data,
+                                                   ModelPtr shared_model) {
   const auto id = require_id(data);
   nlohmann::json previous_state = nlohmann::json::object();
   {
@@ -139,6 +141,9 @@ nlohmann::json SimulationInstanceManager::visual_model(const nlohmann::json& dat
 
 nlohmann::json SimulationInstanceManager::write_ctrl(const nlohmann::json& data) {
   return find_or_throw(require_id(data))->write_ctrl(data);
+}
+nlohmann::json SimulationInstanceManager::write_qpos(const nlohmann::json& data) {
+  return find_or_throw(require_id(data))->write_qpos(data);
 }
 nlohmann::json SimulationInstanceManager::list() const {
   std::vector<std::shared_ptr<SimulationInstance>> instances;

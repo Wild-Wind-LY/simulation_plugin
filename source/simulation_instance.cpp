@@ -296,6 +296,49 @@ nlohmann::json SimulationInstance::write_ctrl(const nlohmann::json& data) {
 
   return state_locked();
 }
+
+nlohmann::json SimulationInstance::write_qpos(const nlohmann::json& data) {
+  std::lock_guard lock{mutex_};
+  if (!model_ || !data_) {
+    status_ = Status::Error;
+    return state_locked();
+  }
+  if (model_->njnt <= 0) throw std::invalid_argument("model has no joints");
+
+  if (!data.contains("values") || !data["values"].is_object()) {
+    throw std::invalid_argument("missing 'values' object (joint name/id -> position)");
+  }
+
+  for (auto it = data["values"].begin(); it != data["values"].end(); ++it) {
+    int index = -1;
+    try {
+      size_t consumed = 0;
+      const int parsed = std::stoi(it.key(), &consumed);
+      if (consumed == it.key().size()) index = parsed;
+    } catch (...) {
+    }
+    if (index < 0) index = mj_name2id(model_, mjOBJ_JOINT, it.key().c_str());
+    if (index < 0 || index >= model_->njnt) {
+      throw std::invalid_argument("joint not found: " + it.key());
+    }
+    const int type = model_->jnt_type[index];
+    if (type != mjJNT_HINGE && type != mjJNT_SLIDE) {
+      throw std::invalid_argument("joint is not scalar (hinge/slide): " + it.key());
+    }
+    double value = it.value().get<double>();
+    if (model_->jnt_limited[index]) {
+      value = std::clamp(value, model_->jnt_range[2 * index], model_->jnt_range[2 * index + 1]);
+    }
+    data_->qpos[model_->jnt_qposadr[index]] = value;
+    // 拖关节是摆位操作：清掉该自由度残余速度，避免松手后继续漂移
+    data_->qvel[model_->jnt_dofadr[index]] = 0.0;
+  }
+
+  // 立即做一次前向运动学，暂停状态下 visual/state 也能反映新姿态
+  mj_forward(model_, data_);
+  return state_locked();
+}
+
 const char* SimulationInstance::status_text(Status status) noexcept {
   switch (status) {
     case Status::Created:
@@ -433,13 +476,18 @@ nlohmann::json SimulationInstance::metadata_locked() const {
 
   out["joints"] = nlohmann::json::array();
   for (int i = 0; i < model_->njnt; ++i) {
-    out["joints"].push_back({
+    nlohmann::json joint = {
         {"id", i},
         {"name", object_name(model_, mjOBJ_JOINT, i)},
         {"type", model_->jnt_type[i]},
         {"qpos_adr", model_->jnt_qposadr[i]},
         {"dof_adr", model_->jnt_dofadr[i]},
-    });
+        {"limited", static_cast<bool>(model_->jnt_limited[i])},
+    };
+    if (model_->jnt_limited[i]) {
+      joint["range"] = {model_->jnt_range[2 * i], model_->jnt_range[2 * i + 1]};
+    }
+    out["joints"].push_back(std::move(joint));
   }
 
   out["actuators"] = nlohmann::json::array();

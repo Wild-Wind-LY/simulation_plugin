@@ -30,8 +30,7 @@ public:
     std::string error;
   };
 
-  static CreateResult create(std::string id, std::string model_path,
-                             ModelPtr shared_model = {});
+  static CreateResult create(std::string id, std::string model_path, ModelPtr shared_model = {});
 
   SimulationInstance(const SimulationInstance&) = delete;
   SimulationInstance& operator=(const SimulationInstance&) = delete;
@@ -53,6 +52,7 @@ public:
   nlohmann::json sensor_state() const;
   nlohmann::json visual_model(bool include_geometry = true) const;
   nlohmann::json write_ctrl(const nlohmann::json& data);
+  nlohmann::json write_qpos(const nlohmann::json& data);
 
 private:
   SimulationInstance(std::string id, std::string model_path, ModelPtr model, mjData* data);

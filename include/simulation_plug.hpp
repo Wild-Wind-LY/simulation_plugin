@@ -86,6 +86,7 @@ private:
   JsonRpcResult handle_control_joint_state(const nlohmann::json& data);
   JsonRpcResult handle_control_sensor_state(const nlohmann::json& data);
   JsonRpcResult handle_control_write_ctrl(const nlohmann::json& data);
+  JsonRpcResult handle_control_write_qpos(const nlohmann::json& data);
   JsonRpcResult handle_task_create(const nlohmann::json& data);
   JsonRpcResult handle_task_remove(const nlohmann::json& data);
   JsonRpcResult handle_task_list(const nlohmann::json& data);

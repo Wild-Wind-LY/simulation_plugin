@@ -29,6 +29,7 @@ public:
   nlohmann::json sensor_state(const nlohmann::json& data) const;
   nlohmann::json visual_model(const nlohmann::json& data) const;
   nlohmann::json write_ctrl(const nlohmann::json& data);
+  nlohmann::json write_qpos(const nlohmann::json& data);
   nlohmann::json list() const;
   nlohmann::json destroy(const nlohmann::json& data);
   void stop_all() noexcept;

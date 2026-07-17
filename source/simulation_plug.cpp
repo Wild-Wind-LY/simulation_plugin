@@ -144,6 +144,8 @@ JsonRpcRouter::RouteMap SimulationPlug::build_routes() {
        [this](const nlohmann::json& data) { return handle_control_sensor_state(data); }},
       {"control.write_ctrl",
        [this](const nlohmann::json& data) { return handle_control_write_ctrl(data); }},
+      {"control.write_qpos",
+       [this](const nlohmann::json& data) { return handle_control_write_qpos(data); }},
 
   };
 }
@@ -655,6 +657,16 @@ JsonRpcResult SimulationPlug::handle_control_write_ctrl(const nlohmann::json& da
     return route_error("control.write_ctrl", e);
   }
 }
+
+JsonRpcResult SimulationPlug::handle_control_write_qpos(const nlohmann::json& data) {
+  try {
+    auto state = instances_.write_qpos(data);
+    publish_state(state);
+    return JsonRpcResult::ok("qpos written", std::move(state));
+  } catch (const std::exception& e) {
+    return route_error("control.write_qpos", e);
+  }
+}
 JsonRpcResult SimulationPlug::handle_task_create(const nlohmann::json& data) {
   try {
     return JsonRpcResult::ok("task created", tasks_.create(data));
@@ -1134,10 +1146,9 @@ void SimulationPlug::note_ws_send_failure(const char* operation, const char* ses
   // 1,2,4,8... 次时记录，既能看到持续失败，又避免高频状态发送刷日志。
   if ((failures & (failures - 1)) == 0) {
     if (topic && topic[0] != '\0') {
-      LOG_WARN(
-          "[{}] WS {} failed: result={}, session={}, topic={}, bytes={}, total_failures={}", TAG,
-          operation ? operation : "send", plugin_ws_send_result_name(result),
-          session_id ? session_id : "", topic, bytes, failures);
+      LOG_WARN("[{}] WS {} failed: result={}, session={}, topic={}, bytes={}, total_failures={}",
+               TAG, operation ? operation : "send", plugin_ws_send_result_name(result),
+               session_id ? session_id : "", topic, bytes, failures);
     } else {
       LOG_WARN("[{}] WS {} failed: result={}, session={}, bytes={}, total_failures={}", TAG,
                operation ? operation : "send", plugin_ws_send_result_name(result),
