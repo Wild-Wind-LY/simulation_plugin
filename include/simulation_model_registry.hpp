@@ -48,7 +48,6 @@ public:
 private:
   static std::filesystem::path default_storage_dir();
   static std::string key(const std::string& id, const std::string& version);
-  static std::string detect_format(const std::filesystem::path& path);
   static int64_t now_ms();
   static std::filesystem::path normalize_path(const std::string& path_text);
   static bool is_newer_version(const nlohmann::json& candidate, const nlohmann::json& current);

@@ -480,6 +480,7 @@ nlohmann::json SimulationInstance::metadata_locked() const {
         {"id", i},
         {"name", object_name(model_, mjOBJ_JOINT, i)},
         {"type", model_->jnt_type[i]},
+        {"body", object_name(model_, mjOBJ_BODY, model_->jnt_bodyid[i])},
         {"qpos_adr", model_->jnt_qposadr[i]},
         {"dof_adr", model_->jnt_dofadr[i]},
         {"limited", static_cast<bool>(model_->jnt_limited[i])},
@@ -488,6 +489,16 @@ nlohmann::json SimulationInstance::metadata_locked() const {
       joint["range"] = {model_->jnt_range[2 * i], model_->jnt_range[2 * i + 1]};
     }
     out["joints"].push_back(std::move(joint));
+  }
+
+  // body 树（含父链），前端用于把点选的 link 映射到最近的驱动关节
+  out["bodies"] = nlohmann::json::array();
+  for (int i = 0; i < model_->nbody; ++i) {
+    out["bodies"].push_back({
+        {"id", i},
+        {"name", object_name(model_, mjOBJ_BODY, i)},
+        {"parent_id", model_->body_parentid[i]},
+    });
   }
 
   out["actuators"] = nlohmann::json::array();

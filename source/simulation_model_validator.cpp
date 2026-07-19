@@ -29,7 +29,7 @@ nlohmann::json SimulationModelValidator::validate(const nlohmann::json& data) co
   const std::string path_text = data.value("model_path", "");
   nlohmann::json out = {
       {"valid", false},          {"controllable", false},
-      {"model_path", path_text}, {"format", detect_format(path_text)},
+      {"model_path", path_text}, {"format", simulation_detect_model_format(path_text)},
       {"errors", errors},        {"warnings", warnings},
   };
 
@@ -113,15 +113,4 @@ nlohmann::json SimulationModelValidator::validate(const nlohmann::json& data) co
 
   mj_deleteModel(model);
   return out;
-}
-
-std::string SimulationModelValidator::detect_format(const std::string& path) {
-  std::filesystem::path p{path};
-  auto ext = p.extension().string();
-  std::transform(ext.begin(), ext.end(), ext.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  if (ext == ".urdf") return "urdf";
-  if (ext == ".xml" || ext == ".mjcf") return "mjcf";
-  if (ext.empty()) return "unknown";
-  return ext.substr(1);
 }

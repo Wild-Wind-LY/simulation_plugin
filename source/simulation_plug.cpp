@@ -57,7 +57,7 @@ bool SimulationPlug::on_start() noexcept {
   ws_options.max_send_message_size = 8 * 1024 * 1024;
   ws_options.max_sessions = 32;
   ws_options.max_send_queue_messages = 32;
-  ws_options.max_send_queue_bytes = 16 * 1024 * 1024;
+  ws_options.max_send_queue_bytes = 8 * 1024 * 1024;
   if (!register_ws_endpoint(
           "simulation",
           [this](const char* session_id, const void* data, size_t size, PluginWsMessageType type) {

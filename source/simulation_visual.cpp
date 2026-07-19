@@ -235,7 +235,7 @@ nlohmann::json simulation_visual_json(const mjModel* model, const mjData* data,
     }
     out["items"].push_back(std::move(item));
   }
-  // 被引用的 2D 纹理：最长边降采样到 256 以内后按原始通道 base64 传输
+  // 被引用的 2D 纹理：最长边降采样到 512 以内后按原始通道 base64 传输
   if (!used_textures.empty()) {
     nlohmann::json textures = nlohmann::json::array();
     for (int t : used_textures) {
@@ -244,7 +244,7 @@ nlohmann::json simulation_visual_json(const mjModel* model, const mjData* data,
       const int channels = model->tex_nchannel[t];
       if (width <= 0 || height <= 0 || channels <= 0 || channels > 4) continue;
       const mjtByte* src = model->tex_data + model->tex_adr[t];
-      constexpr int kMaxSide = 256;
+      constexpr int kMaxSide = 512;
       const int stride = std::max(1, (std::max(width, height) + kMaxSide - 1) / kMaxSide);
       const int out_width = std::max(1, width / stride);
       const int out_height = std::max(1, height / stride);

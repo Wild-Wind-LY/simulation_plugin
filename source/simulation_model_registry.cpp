@@ -146,7 +146,7 @@ nlohmann::json SimulationModelRegistry::register_model(const nlohmann::json& dat
   const auto source = normalize_path(path_text);
   if (!std::filesystem::exists(source))
     throw std::invalid_argument("model path does not exist: " + source.string());
-  const std::string format = detect_format(source);
+  const std::string format = simulation_detect_model_format(source);
   if (format != "mjcf" && format != "urdf")
     throw std::invalid_argument("unsupported model format: " + format);
 
@@ -351,27 +351,6 @@ std::filesystem::path SimulationModelRegistry::default_storage_dir() {
 
 std::string SimulationModelRegistry::key(const std::string& id, const std::string& version) {
   return id + "@" + version;
-}
-
-std::string SimulationModelRegistry::detect_format(const std::filesystem::path& path) {
-  auto extension = path.extension().string();
-  std::transform(extension.begin(), extension.end(), extension.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-  // Content sniff wins over the extension so a URDF named `.xml` is classified
-  // correctly (and vice versa).
-  std::ifstream input(path, std::ios::binary);
-  if (input) {
-    std::string head(4096, '\0');
-    input.read(head.data(), static_cast<std::streamsize>(head.size()));
-    head.resize(static_cast<size_t>(input.gcount()));
-    if (head.find("<robot") != std::string::npos) return "urdf";
-    if (head.find("<mujoco") != std::string::npos) return "mjcf";
-  }
-
-  if (extension == ".urdf") return "urdf";
-  if (extension == ".xml" || extension == ".mjcf") return "mjcf";
-  return extension.empty() ? "unknown" : extension.substr(1);
 }
 
 int64_t SimulationModelRegistry::now_ms() {

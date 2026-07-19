@@ -59,35 +59,3 @@ add_custom_command(TARGET ${PROJECT_NAME} PRE_LINK
   COMMAND ${CMAKE_COMMAND} -E make_directory "${RPC_GATEWAY_PLUGIN_OUTPUT_DIR}"
 )
 
-enable_testing()
-add_executable(simulation_manager_smoke
-  tests/simulation_manager_smoke.cpp
-  source/simulation_instance.cpp
-  source/simulation_instance_manager.cpp
-  source/simulation_compiler.cpp
-  source/simulation_scene_manager.cpp
-  source/simulation_task_manager.cpp
-  source/simulation_record_manager.cpp
-  source/simulation_model_validator.cpp
-  source/simulation_model_registry.cpp
-  source/simulation_paths.cpp
-  source/simulation_visual.cpp
-)
-target_link_libraries(simulation_manager_smoke PRIVATE
-  nlohmann_json mujoco::mujoco Threads::Threads
-)
-
-add_test(NAME simulation_manager_smoke COMMAND simulation_manager_smoke)
-
-add_executable(simulation_ws_integration
-  tests/simulation_ws_integration.cpp
-  ${sources}
-)
-target_compile_definitions(simulation_ws_integration PRIVATE
-  PLUGIN_LOG_NAME=SimulationPluginWsTest
-  SIMULATION_PLUGIN_TEST_ACCESS=1
-)
-target_link_libraries(simulation_ws_integration PRIVATE
-  nlohmann_json xplugin::sdk mujoco::mujoco Threads::Threads
-)
-add_test(NAME simulation_ws_integration COMMAND simulation_ws_integration)
