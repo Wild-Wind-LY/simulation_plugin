@@ -5,56 +5,27 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
+#include "simulation_json_utils.hpp"
 #include "simulation_mujoco_utils.hpp"
 #include "simulation_visual.hpp"
 
 namespace {
 
-  std::string object_name(const mjModel* model, int object_type, int id) {
-    const char* name = mj_id2name(model, object_type, id);
-    return name ? std::string{name} : std::string{};
-  }
-
-  nlohmann::json numeric_array(const float* values, int count) {
-    nlohmann::json out = nlohmann::json::array();
-    if (!values || count <= 0) return out;
-
-    for (int i = 0; i < count; ++i) {
-      out.push_back(static_cast<double>(values[i]));
+  // Shared by write_ctrl/write_qpos: accept either a numeric index or an object
+  // name for `key`; returns -1 if it doesn't resolve to a valid index < limit.
+  int resolve_index(const mjModel* model, int object_type, const std::string& key, int limit) {
+    int index = -1;
+    try {
+      size_t consumed = 0;
+      const int parsed = std::stoi(key, &consumed);
+      if (consumed == key.size()) index = parsed;
+    } catch (...) {
     }
-    return out;
-  }
-  std::string geom_shape(int type) {
-    switch (type) {
-      case mjGEOM_PLANE:
-        return "plane";
-      case mjGEOM_SPHERE:
-        return "sphere";
-      case mjGEOM_CAPSULE:
-        return "capsule";
-      case mjGEOM_ELLIPSOID:
-        return "ellipsoid";
-      case mjGEOM_CYLINDER:
-        return "cylinder";
-      case mjGEOM_BOX:
-        return "box";
-      case mjGEOM_MESH:
-        return "mesh";
-      case mjGEOM_HFIELD:
-        return "hfield";
-      default:
-        return "unsupported";
-    }
-  }
-  nlohmann::json numeric_array(const mjtNum* values, int count) {
-    nlohmann::json out = nlohmann::json::array();
-    if (!values || count <= 0) return out;
-
-    for (int i = 0; i < count; ++i) {
-      out.push_back(static_cast<double>(values[i]));
-    }
-    return out;
+    if (index < 0) index = mj_name2id(model, object_type, key.c_str());
+    if (index < 0 || index >= limit) return -1;
+    return index;
   }
 
 }  // namespace
@@ -99,18 +70,21 @@ nlohmann::json SimulationInstance::configure(const nlohmann::json& data) {
     return state_locked();
   }
 
-  initial_config_ = nlohmann::json::object();
   scene_id_ = data.value("scene_id", scene_id_);
   compiled_model_id_ = data.value("compiled_model_id", compiled_model_id_);
   step_hz_ = clamp_rate(data.value("step_hz", step_hz_), step_hz_, 1.0, 5000.0);
   publish_hz_ = clamp_rate(data.value("publish_hz", publish_hz_), publish_hz_, 0.0, 200.0);
+  // Merge into initial_config_ (like apply_runtime does) rather than wiping it: a later
+  // configure() call that only touches e.g. scene_id must not drop a previously-set qpos.
   if (data.contains("qpos")) {
     assign_array(data_->qpos, model_->nq, data.at("qpos"), "qpos");
     initial_config_["qpos"] = data.at("qpos");
+    needs_forward_ = true;
   }
   if (data.contains("qvel")) {
     assign_array(data_->qvel, model_->nv, data.at("qvel"), "qvel");
     initial_config_["qvel"] = data.at("qvel");
+    needs_forward_ = true;
   }
   if (data.contains("ctrl")) {
     assign_array(data_->ctrl, model_->nu, data.at("ctrl"), "ctrl");
@@ -157,19 +131,29 @@ nlohmann::json SimulationInstance::stop() {
   return state_locked();
 }
 
-nlohmann::json SimulationInstance::step(int count) {
-  std::lock_guard lock{mutex_};
-  if (!model_ || !data_) {
-    status_ = Status::Error;
-    return state_locked();
+nlohmann::json SimulationInstance::step(int count, bool include_state) {
+  const int steps = std::max(1, count);
+  // Release the lock every kMaxStepsPerLock steps so a large batch (up to 100000)
+  // doesn't make state()/stop()/write_ctrl() block for the whole call.
+  constexpr int kMaxStepsPerLock = 256;
+  int done = 0;
+  while (done < steps) {
+    std::lock_guard lock{mutex_};
+    if (!model_ || !data_) {
+      status_ = Status::Error;
+      return state_locked();
+    }
+    if (stop_requested_) break;
+    const int batch = std::min(kMaxStepsPerLock, steps - done);
+    for (int i = 0; i < batch; ++i) {
+      mj_step(model_, data_);
+    }
+    step_count_ += static_cast<uint64_t>(batch);
+    done += batch;
   }
 
-  const int steps = std::max(1, count);
-  for (int i = 0; i < steps; ++i) {
-    mj_step(model_, data_);
-  }
-  step_count_ += static_cast<uint64_t>(steps);
-  return state_locked();
+  std::lock_guard lock{mutex_};
+  return state_locked(include_state);
 }
 
 nlohmann::json SimulationInstance::reset() {
@@ -191,6 +175,7 @@ nlohmann::json SimulationInstance::reset() {
   }
   step_count_ = 0;
   status_ = Status::Created;
+  needs_forward_ = true;
   return state_locked();
 }
 
@@ -212,10 +197,12 @@ nlohmann::json SimulationInstance::apply_runtime(const nlohmann::json& data) {
   if (runtime.contains("qpos")) {
     assign_array(data_->qpos, model_->nq, runtime.at("qpos"), "qpos");
     initial_config_["qpos"] = runtime.at("qpos");
+    needs_forward_ = true;
   }
   if (runtime.contains("qvel")) {
     assign_array(data_->qvel, model_->nv, runtime.at("qvel"), "qvel");
     initial_config_["qvel"] = runtime.at("qvel");
+    needs_forward_ = true;
   }
   if (runtime.contains("ctrl")) {
     assign_array(data_->ctrl, model_->nu, runtime.at("ctrl"), "ctrl");
@@ -280,17 +267,8 @@ nlohmann::json SimulationInstance::write_ctrl(const nlohmann::json& data) {
   }
 
   for (auto it = data["values"].begin(); it != data["values"].end(); ++it) {
-    int index = -1;
-    try {
-      size_t consumed = 0;
-      const int parsed = std::stoi(it.key(), &consumed);
-      if (consumed == it.key().size()) index = parsed;
-    } catch (...) {
-    }
-    if (index < 0) index = mj_name2id(model_, mjOBJ_ACTUATOR, it.key().c_str());
-    if (index < 0 || index >= model_->nu) {
-      throw std::invalid_argument("actuator not found: " + it.key());
-    }
+    const int index = resolve_index(model_, mjOBJ_ACTUATOR, it.key(), model_->nu);
+    if (index < 0) throw std::invalid_argument("actuator not found: " + it.key());
     data_->ctrl[index] = it.value().get<double>();
   }
 
@@ -310,17 +288,8 @@ nlohmann::json SimulationInstance::write_qpos(const nlohmann::json& data) {
   }
 
   for (auto it = data["values"].begin(); it != data["values"].end(); ++it) {
-    int index = -1;
-    try {
-      size_t consumed = 0;
-      const int parsed = std::stoi(it.key(), &consumed);
-      if (consumed == it.key().size()) index = parsed;
-    } catch (...) {
-    }
-    if (index < 0) index = mj_name2id(model_, mjOBJ_JOINT, it.key().c_str());
-    if (index < 0 || index >= model_->njnt) {
-      throw std::invalid_argument("joint not found: " + it.key());
-    }
+    const int index = resolve_index(model_, mjOBJ_JOINT, it.key(), model_->njnt);
+    if (index < 0) throw std::invalid_argument("joint not found: " + it.key());
     const int type = model_->jnt_type[index];
     if (type != mjJNT_HINGE && type != mjJNT_SLIDE) {
       throw std::invalid_argument("joint is not scalar (hinge/slide): " + it.key());
@@ -334,8 +303,10 @@ nlohmann::json SimulationInstance::write_qpos(const nlohmann::json& data) {
     data_->qvel[model_->jnt_dofadr[index]] = 0.0;
   }
 
-  // 立即做一次前向运动学，暂停状态下 visual/state 也能反映新姿态
-  mj_forward(model_, data_);
+  // visual_model_locked() does the forward lazily on next access (needed for
+  // the pose to show correctly even while paused, without paying for it here
+  // if nothing ever queries the visual model before the next step/write).
+  needs_forward_ = true;
   return state_locked();
 }
 
@@ -378,9 +349,20 @@ void SimulationInstance::worker_loop(PublishFn publisher) {
   auto last_publish = clock::now();
 
   while (true) {
-    nlohmann::json snapshot;
     double step_hz = 100.0;
     double publish_hz = 10.0;
+    bool errored = false;
+    bool want_publish = false;
+    // Populated under the lock (cheap raw copy) only on a publish tick; the
+    // (more expensive) JSON construction happens after releasing the lock below,
+    // so a synchronous RPC against this instance (state()/write_ctrl()/stop())
+    // only ever waits on this thread's mj_step, not also on building/allocating
+    // the snapshot JSON.
+    std::string id_copy, status_copy, model_path_copy, scene_id_copy, compiled_model_id_copy;
+    uint64_t step_count_copy = 0;
+    double time_copy = 0.0;
+    int nq = 0, nv = 0, nu = 0, nsensordata = 0;
+    std::vector<mjtNum> qpos_copy, qvel_copy, ctrl_copy, sensordata_copy;
 
     {
       std::unique_lock lock{mutex_};
@@ -392,7 +374,7 @@ void SimulationInstance::worker_loop(PublishFn publisher) {
 
       if (!model_ || !data_) {
         status_ = Status::Error;
-        snapshot = state_locked();
+        errored = true;
       } else {
         mj_step(model_, data_);
         ++step_count_;
@@ -404,10 +386,45 @@ void SimulationInstance::worker_loop(PublishFn publisher) {
                                           ? std::chrono::duration<double>(1.0 / publish_hz)
                                           : std::chrono::duration<double>::max();
         if (publish_hz > 0.0 && now - last_publish >= publish_interval) {
-          snapshot = state_locked();
+          want_publish = true;
           last_publish = now;
+          id_copy = id_;
+          status_copy = status_text(status_);
+          model_path_copy = model_path_;
+          scene_id_copy = scene_id_;
+          compiled_model_id_copy = compiled_model_id_;
+          step_count_copy = step_count_;
+          time_copy = static_cast<double>(data_->time);
+          nq = model_->nq;
+          nv = model_->nv;
+          nu = model_->nu;
+          nsensordata = model_->nsensordata;
+          qpos_copy.assign(data_->qpos, data_->qpos + nq);
+          qvel_copy.assign(data_->qvel, data_->qvel + nv);
+          ctrl_copy.assign(data_->ctrl, data_->ctrl + nu);
+          sensordata_copy.assign(data_->sensordata, data_->sensordata + nsensordata);
         }
       }
+    }
+
+    nlohmann::json snapshot;
+    if (errored) {
+      snapshot = state();  // rare path; a fresh lock here is fine
+    } else if (want_publish) {
+      snapshot["id"] = id_copy;
+      snapshot["status"] = status_copy;
+      snapshot["model_path"] = model_path_copy;
+      if (!scene_id_copy.empty()) snapshot["scene_id"] = scene_id_copy;
+      if (!compiled_model_id_copy.empty()) snapshot["compiled_model_id"] = compiled_model_id_copy;
+      snapshot["step_count"] = step_count_copy;
+      snapshot["step_hz"] = step_hz;
+      snapshot["publish_hz"] = publish_hz;
+      snapshot["time"] = time_copy;
+      snapshot["model"] = {{"nq", nq}, {"nv", nv}, {"nu", nu}, {"nsensordata", nsensordata}};
+      snapshot["qpos"] = numeric_array(qpos_copy.data(), nq);
+      snapshot["qvel"] = numeric_array(qvel_copy.data(), nv);
+      snapshot["ctrl"] = numeric_array(ctrl_copy.data(), nu);
+      snapshot["sensordata"] = numeric_array(sensordata_copy.data(), nsensordata);
     }
 
     if (!snapshot.is_null() && publisher) publisher(snapshot);
@@ -426,7 +443,7 @@ void SimulationInstance::request_worker_stop() {
   if (worker_.joinable()) worker_.join();
 }
 
-nlohmann::json SimulationInstance::state_locked() const {
+nlohmann::json SimulationInstance::state_locked(bool include_arrays) const {
   nlohmann::json out;
   out["id"] = id_;
   out["status"] = status_text(status_);
@@ -449,10 +466,12 @@ nlohmann::json SimulationInstance::state_locked() const {
       {"nu", model_->nu},
       {"nsensordata", model_->nsensordata},
   };
-  out["qpos"] = numeric_array(data_->qpos, model_->nq);
-  out["qvel"] = numeric_array(data_->qvel, model_->nv);
-  out["ctrl"] = numeric_array(data_->ctrl, model_->nu);
-  out["sensordata"] = numeric_array(data_->sensordata, model_->nsensordata);
+  if (include_arrays) {
+    out["qpos"] = numeric_array(data_->qpos, model_->nq);
+    out["qvel"] = numeric_array(data_->qvel, model_->nv);
+    out["ctrl"] = numeric_array(data_->ctrl, model_->nu);
+    out["sensordata"] = numeric_array(data_->sensordata, model_->nsensordata);
+  }
   return out;
 }
 nlohmann::json SimulationInstance::metadata_locked() const {
@@ -537,7 +556,13 @@ nlohmann::json SimulationInstance::visual_model_locked(bool include_geometry) co
   if (!scene_id_.empty()) out["scene_id"] = scene_id_;
   if (!model_ || !data_) return out;
 
-  mj_forward(model_, data_);
+  // mj_step already leaves body/geom world poses consistent, so only re-forward
+  // when something touched qpos/qvel directly (configure/apply_runtime/reset/write_qpos)
+  // since the last time this was computed.
+  if (needs_forward_) {
+    mj_forward(model_, data_);
+    needs_forward_ = false;
+  }
   out.update(simulation_visual_json(model_, data_, include_geometry));
   out["status"] = status_text(status_);
   out["time"] = data_->time;

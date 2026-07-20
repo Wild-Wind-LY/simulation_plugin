@@ -68,10 +68,6 @@ namespace {
 
   // ------------------------- filesystem helpers --------------------------
 
-  bool is_ignored_dir_name(const std::string& name) {
-    return name == ".git" || name == ".svn" || name == ".hg";
-  }
-
   // Opaque, comparable filesystem tick for the effective file. Not a wall-clock
   // timestamp (the file_time_type epoch is implementation defined), but enough to
   // notice that the file changed without re-hashing.
@@ -224,9 +220,6 @@ nlohmann::json SimulationModelRegistry::register_model(const nlohmann::json& dat
     throw std::invalid_argument("model has no actuators but require_actuators was set");
   }
 
-  const std::string digest = sha256_file(effective_path);
-  const uint64_t bytes = static_cast<uint64_t>(std::filesystem::file_size(effective_path, ec));
-
   nlohmann::json entry = {
       {"id", id},
       {"version", version},
@@ -234,9 +227,6 @@ nlohmann::json SimulationModelRegistry::register_model(const nlohmann::json& dat
       {"packaged", packaged},
       {"origin_path", source.string()},
       {"registered_ms", now_ms()},
-      {"content_sha256", digest},
-      {"content_bytes", bytes},
-      {"content_mtime_tick", file_mtime_tick(effective_path)},
       {"sizes", metadata.value("sizes", nlohmann::json::object())},
       {"controllable", controllable},
       {"warnings", metadata.value("warnings", nlohmann::json::array())},
@@ -246,20 +236,39 @@ nlohmann::json SimulationModelRegistry::register_model(const nlohmann::json& dat
     entry["effective_rel"] = std::filesystem::relative(effective_path, storage_dir_).string();
     entry["source_rel"] = std::filesystem::relative(source_copy, storage_dir_).string();
     // Whole-package digest so tampering with any snapshotted mesh/texture/model
-    // file is detectable, not only the top-level model file.
+    // file is detectable, not only the top-level model file. integrity_status()
+    // only ever checks this digest once packaged, so there's no need to also
+    // hash `effective_path` on its own (that would just re-read+re-hash bytes
+    // already covered by the directory digest, for a value nothing consults).
+    const auto fingerprint = simulation::directory_fingerprint(pkg);
     entry["package_sha256"] = sha256_directory(pkg);
+    entry["package_file_count"] = fingerprint.file_count;
+    entry["package_total_bytes"] = fingerprint.total_bytes;
+    entry["package_mtime_tick"] = fingerprint.max_mtime_ticks;
   } else {
     entry["effective_path"] = effective_path.string();
     entry["source_path"] = source_copy.string();
+    entry["content_sha256"] = sha256_file(effective_path);
+    entry["content_bytes"] = static_cast<uint64_t>(std::filesystem::file_size(effective_path, ec));
+    entry["content_mtime_tick"] = file_mtime_tick(effective_path);
   }
 
-  std::lock_guard lock{mutex_};
-  if (entries_.find(entry_key) != entries_.end() && !replace) {
-    std::filesystem::remove_all(pkg, ec);
-    throw std::invalid_argument("model version already registered: " + entry_key);
+  nlohmann::json manifest_snapshot;
+  uint64_t generation = 0;
+  {
+    std::lock_guard lock{mutex_};
+    if (entries_.find(entry_key) != entries_.end() && !replace) {
+      std::filesystem::remove_all(pkg, ec);
+      throw std::invalid_argument("model version already registered: " + entry_key);
+    }
+    entries_[entry_key] = entry;
+    manifest_snapshot = snapshot_manifest_locked();
+    generation = ++manifest_generation_;
   }
-  entries_[entry_key] = entry;
-  save_manifest_locked();
+  // Manifest write happens without `mutex_` held so it doesn't block concurrent
+  // list()/info()/verify()/resolve_scene() calls (a quick map lookup each) for
+  // the write's duration.
+  persist_manifest(std::move(manifest_snapshot), generation);
   return hydrate(entry);
 }
 
@@ -294,20 +303,36 @@ nlohmann::json SimulationModelRegistry::remove(const nlohmann::json& data) {
   if (id.empty() || version.empty())
     throw std::invalid_argument("model remove requires id and version");
 
-  std::lock_guard lock{mutex_};
-  auto it = entries_.find(key(id, version));
-  if (it == entries_.end()) throw std::out_of_range("model version not found");
-  const auto entry = it->second;
-  entries_.erase(it);
+  nlohmann::json manifest_snapshot;
+  uint64_t generation = 0;
+  {
+    std::lock_guard lock{mutex_};
+    auto it = entries_.find(key(id, version));
+    if (it == entries_.end()) throw std::out_of_range("model version not found");
+    const auto entry = it->second;
+    entries_.erase(it);
 
-  std::error_code ec;
-  if (entry.value("packaged", false)) {
-    const auto pkg = package_dir(id, version);
-    if (is_within(pkg, storage_dir_)) std::filesystem::remove_all(pkg, ec);
-  } else if (entry.value("format", "") == "urdf") {
-    std::filesystem::remove(entry.value("effective_path", ""), ec);
+    std::error_code ec;
+    if (entry.value("packaged", false)) {
+      const auto pkg = package_dir(id, version);
+      if (is_within(pkg, storage_dir_)) std::filesystem::remove_all(pkg, ec);
+
+      // Last version of this id gone: the now-empty "<storage_dir_>/<id>/" parent
+      // is otherwise orphaned on disk forever, since nothing else ever cleans it up.
+      const bool other_versions
+          = std::any_of(entries_.begin(), entries_.end(),
+                        [&](const auto& kv) { return kv.second.value("id", "") == id; });
+      if (!other_versions) {
+        const auto model_dir = pkg.parent_path();
+        if (is_within(model_dir, storage_dir_)) std::filesystem::remove_all(model_dir, ec);
+      }
+    } else if (entry.value("format", "") == "urdf") {
+      std::filesystem::remove(entry.value("effective_path", ""), ec);
+    }
+    manifest_snapshot = snapshot_manifest_locked();
+    generation = ++manifest_generation_;
   }
-  save_manifest_locked();
+  persist_manifest(std::move(manifest_snapshot), generation);
   return {{"id", id}, {"version", version}, {"removed", true}};
 }
 
@@ -380,62 +405,10 @@ std::filesystem::path SimulationModelRegistry::package_dir(const std::string& id
 std::filesystem::path SimulationModelRegistry::snapshot_package(
     const std::filesystem::path& asset_root, const std::filesystem::path& pkg_dir,
     uint64_t max_bytes) const {
-  namespace fs = std::filesystem;
-  const fs::path root = fs::weakly_canonical(asset_root);
-  if (!fs::is_directory(root))
-    throw std::invalid_argument("asset root is not a directory: " + root.string());
-
-  // Pre-scan to enforce the size cap before copying anything.
-  uint64_t total_bytes = 0;
-  uint64_t file_count = 0;
   constexpr uint64_t kMaxFiles = 50000;
-  for (auto it
-       = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied);
-       it != fs::recursive_directory_iterator(); ++it) {
-    const auto& entry = *it;
-    if (entry.is_directory() && is_ignored_dir_name(entry.path().filename().string())) {
-      it.disable_recursion_pending();
-      continue;
-    }
-    if (entry.is_symlink()) continue;
-    if (entry.is_regular_file()) {
-      std::error_code ec;
-      total_bytes += static_cast<uint64_t>(entry.file_size(ec));
-      if (++file_count > kMaxFiles)
-        throw std::invalid_argument(
-            "asset package exceeds file-count limit; narrow it with 'asset_root'");
-      if (total_bytes > max_bytes)
-        throw std::invalid_argument(
-            "asset package exceeds size limit; narrow it with 'asset_root' or raise "
-            "'max_asset_bytes'");
-    }
-  }
-
-  // Copy preserving the relative structure so meshdir/include references keep
-  // resolving inside the package.
-  fs::create_directories(pkg_dir);
-  for (auto it
-       = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied);
-       it != fs::recursive_directory_iterator(); ++it) {
-    const auto& entry = *it;
-    if (entry.is_directory() && is_ignored_dir_name(entry.path().filename().string())) {
-      it.disable_recursion_pending();
-      continue;
-    }
-    if (entry.is_symlink()) continue;
-    const auto rel = fs::relative(entry.path(), root);
-    const auto dest = pkg_dir / rel;
-    std::error_code ec;
-    if (entry.is_directory()) {
-      fs::create_directories(dest, ec);
-    } else if (entry.is_regular_file()) {
-      fs::create_directories(dest.parent_path(), ec);
-      fs::copy_file(entry.path(), dest, fs::copy_options::overwrite_existing, ec);
-      if (ec)
-        throw std::runtime_error("failed to copy asset " + entry.path().string() + ": "
-                                 + ec.message());
-    }
-  }
+  // Narrow-with-asset_root/raise-max_asset_bytes guidance lives in copy_directory_tree's
+  // own error message now (shared with export_scene's asset bundling).
+  simulation::copy_directory_tree(asset_root, pkg_dir, max_bytes, kMaxFiles);
   return pkg_dir;
 }
 
@@ -480,6 +453,22 @@ nlohmann::json SimulationModelRegistry::integrity_status(const nlohmann::json& e
     const std::string package_expected = entry.value("package_sha256", "");
     if (entry.value("packaged", false) && !package_expected.empty()) {
       const auto pkg = package_dir(entry.value("id", ""), entry.value("version", ""));
+
+      // Cheap stat-only pre-check: if the package's file count/total bytes/newest
+      // mtime match what was recorded at registration, nothing plausibly changed --
+      // skip re-reading and re-hashing every file in the package. Only fall back to
+      // the full sha256_directory (which every info()/verify() call used to pay for
+      // unconditionally) when the fingerprint disagrees.
+      if (entry.contains("package_file_count")) {
+        const simulation::DirectoryFingerprint expected_fp{
+            entry.value("package_file_count", uint64_t{0}),
+            entry.value("package_total_bytes", uint64_t{0}),
+            entry.value("package_mtime_tick", int64_t{0})};
+        if (simulation::directory_fingerprint(pkg) == expected_fp) {
+          return {{"ok", true}, {"reason", "package unchanged (fingerprint match)"}};
+        }
+      }
+
       const std::string actual = sha256_directory(pkg);
       if (actual == package_expected) return {{"ok", true}, {"reason", "package digest matches"}};
       return {{"ok", false},
@@ -491,6 +480,15 @@ nlohmann::json SimulationModelRegistry::integrity_status(const nlohmann::json& e
 
     const std::string expected = entry.value("content_sha256", "");
     if (expected.empty()) return {{"ok", true}, {"reason", "no digest recorded"}};
+
+    // Same cheap pre-check for the single-file (reference-mode) case.
+    std::error_code ec;
+    const auto live_bytes = static_cast<uint64_t>(std::filesystem::file_size(path, ec));
+    if (!ec && entry.value("content_bytes", uint64_t{0}) == live_bytes
+        && entry.value("content_mtime_tick", int64_t{0}) == file_mtime_tick(path)) {
+      return {{"ok", true}, {"reason", "file unchanged (size/mtime match)"}};
+    }
+
     const std::string actual = sha256_file(path);
     if (actual == expected) return {{"ok", true}, {"reason", "digest matches"}};
     return {{"ok", false},
@@ -557,15 +555,20 @@ void SimulationModelRegistry::load_manifest() {
   }
 }
 
-void SimulationModelRegistry::save_manifest_locked() const {
-  std::filesystem::create_directories(storage_dir_);
+nlohmann::json SimulationModelRegistry::snapshot_manifest_locked() const {
   nlohmann::json models = nlohmann::json::array();
   for (const auto& [entry_key, entry] : entries_) {
     (void)entry_key;
     models.push_back(entry);
   }
-  const nlohmann::json manifest = {{"schema", 2}, {"models", std::move(models)}};
+  return {{"schema", 2}, {"models", std::move(models)}};
+}
 
+void SimulationModelRegistry::persist_manifest(nlohmann::json manifest, uint64_t generation) const {
+  std::lock_guard io_lock{manifest_io_mutex_};
+  if (generation < last_written_generation_) return;  // a newer snapshot already landed
+
+  std::filesystem::create_directories(storage_dir_);
   const auto temporary = manifest_path_.string() + ".tmp";
   {
     std::ofstream output(temporary);
@@ -573,4 +576,5 @@ void SimulationModelRegistry::save_manifest_locked() const {
     output << manifest.dump(2) << '\n';
   }
   std::filesystem::rename(temporary, manifest_path_);
+  last_written_generation_ = generation;
 }

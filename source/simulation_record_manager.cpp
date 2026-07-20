@@ -143,6 +143,13 @@ void SimulationRecordManager::worker_loop(std::shared_ptr<Session> session,
                                           SimulationInstanceManager& instances) {
   std::ofstream output(session->file_path);
   const auto interval = std::chrono::duration<double>(1.0 / session->sample_hz);
+  // Absolute-deadline pacing: advance next_tick by exactly one interval each loop
+  // and sleep until it, rather than always sleeping the full interval *after* the
+  // sample's own work. Under load (slow instances.state() or disk contention) the
+  // old fixed post-work sleep meant the actual sample rate fell below sample_hz
+  // and kept drifting further behind; this instead catches up towards the next
+  // tick (or fires immediately if already late).
+  auto next_tick = std::chrono::steady_clock::now();
 
   while (true) {
     {
@@ -156,8 +163,10 @@ void SimulationRecordManager::worker_loop(std::shared_ptr<Session> session,
       frame["record_id"] = session->id;
       frame["sample_index"] = session->sample_count;
       frame["wall_time_ms"] = now_ms();
+      // No flush() per sample -- rely on ofstream's own buffering (flushed on
+      // stop below) instead of a disk syscall on every single sample, which at
+      // sample_hz up to 1000 was effectively unbuffered I/O.
       output << frame.dump() << '\n';
-      output.flush();
       {
         std::lock_guard lock{session->mutex};
         ++session->sample_count;
@@ -170,15 +179,21 @@ void SimulationRecordManager::worker_loop(std::shared_ptr<Session> session,
           {"error", e.what()},
       };
       output << frame.dump() << '\n';
-      output.flush();
       std::lock_guard lock{session->mutex};
       ++session->sample_count;
       session->stop_requested = true;
     }
 
-    std::this_thread::sleep_for(interval);
+    next_tick += std::chrono::duration_cast<std::chrono::steady_clock::duration>(interval);
+    const auto now = std::chrono::steady_clock::now();
+    if (next_tick > now) {
+      std::this_thread::sleep_for(next_tick - now);
+    } else {
+      next_tick = now;
+    }
   }
 
+  output.flush();
   std::lock_guard lock{session->mutex};
   session->running = false;
   session->ended_ms = now_ms();

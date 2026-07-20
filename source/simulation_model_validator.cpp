@@ -1,11 +1,12 @@
 ﻿#include "simulation_model_validator.hpp"
-#include "simulation_mujoco_utils.hpp"
 
 #include <mujoco/mujoco.h>
 
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+
+#include "simulation_mujoco_utils.hpp"
 
 namespace {
 

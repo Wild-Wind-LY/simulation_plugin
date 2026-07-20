@@ -65,15 +65,20 @@ private:
   static std::string compile_sensor_object(const nlohmann::json& sensor);
   static std::string structural_model_id(const nlohmann::json& scene);
   static ModelPtr load_model(const std::filesystem::path& path);
-  std::filesystem::path write_compiled_mjcf(const nlohmann::json& scene) const;
+  std::filesystem::path write_compiled_mjcf(const nlohmann::json& scene,
+                                            const std::string& compiled_model_id) const;
 
   struct CacheEntry {
     ModelPtr model;
     uint64_t last_used = 0;
+    std::filesystem::path compiled_path;  // only set for compile_scene()'s entries
   };
   // Records `model_id` as most-recently-used and, if the cache is over capacity,
   // evicts the least-recently-used entries that no live instance still holds.
-  ModelPtr touch_and_reclaim_locked(const std::string& model_id, ModelPtr model) const;
+  // `compiled_path`, when non-empty, is stashed on the entry so a later cache hit
+  // can still report it without recompiling.
+  ModelPtr touch_and_reclaim_locked(const std::string& model_id, ModelPtr model,
+                                    std::filesystem::path compiled_path = {}) const;
 
   std::filesystem::path output_dir_;
   size_t max_cached_models_;

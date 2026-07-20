@@ -32,16 +32,15 @@ nlohmann::json SimulationInstanceManager::create(const nlohmann::json& data,
     if (id.empty()) {
       id = "sim-" + std::to_string(next_id_++);
     }
-    if (instances_.find(id) != instances_.end()) {
+    if (instances_.count(id) || pending_.count(id)) {
       throw std::invalid_argument("instance already exists: " + id);
     }
-    instances_.emplace(id, nullptr);
+    pending_.insert(id);
   }
 
   auto cleanup_reservation = [this, &id] {
     std::lock_guard lock{mutex_};
-    auto it = instances_.find(id);
-    if (it != instances_.end() && !it->second) instances_.erase(it);
+    pending_.erase(id);
   };
 
   auto result = SimulationInstance::create(id, model_path, std::move(shared_model));
@@ -55,6 +54,7 @@ nlohmann::json SimulationInstanceManager::create(const nlohmann::json& data,
   {
     std::lock_guard lock{mutex_};
     instances_[id] = std::move(instance);
+    pending_.erase(id);
   }
   return state;
 }
@@ -104,7 +104,7 @@ nlohmann::json SimulationInstanceManager::step(const nlohmann::json& data) {
   if (count < 1 || count > 100000) {
     throw std::invalid_argument("'count' must be in [1, 100000]");
   }
-  return find_or_throw(id)->step(count);
+  return find_or_throw(id)->step(count, data.value("include_state", true));
 }
 
 nlohmann::json SimulationInstanceManager::reset(const nlohmann::json& data) {
@@ -146,18 +146,8 @@ nlohmann::json SimulationInstanceManager::write_qpos(const nlohmann::json& data)
   return find_or_throw(require_id(data))->write_qpos(data);
 }
 nlohmann::json SimulationInstanceManager::list() const {
-  std::vector<std::shared_ptr<SimulationInstance>> instances;
-  {
-    std::lock_guard lock{mutex_};
-    instances.reserve(instances_.size());
-    for (const auto& [id, instance] : instances_) {
-      (void)id;
-      if (instance) instances.push_back(instance);
-    }
-  }
-
   nlohmann::json out = nlohmann::json::array();
-  for (const auto& instance : instances) {
+  for (const auto& instance : snapshot_instances()) {
     out.push_back(instance->state());
   }
   return out;
@@ -169,9 +159,7 @@ nlohmann::json SimulationInstanceManager::destroy(const nlohmann::json& data) {
   {
     std::lock_guard lock{mutex_};
     auto it = instances_.find(id);
-    if (it == instances_.end() || !it->second) {
-      throw std::out_of_range("instance not found: " + id);
-    }
+    if (it == instances_.end()) throw std::out_of_range("instance not found: " + id);
     instance = std::move(it->second);
     instances_.erase(it);
   }
@@ -182,17 +170,7 @@ nlohmann::json SimulationInstanceManager::destroy(const nlohmann::json& data) {
 
 void SimulationInstanceManager::stop_all() noexcept {
   try {
-    std::vector<std::shared_ptr<SimulationInstance>> instances;
-    {
-      std::lock_guard lock{mutex_};
-      instances.reserve(instances_.size());
-      for (const auto& [id, instance] : instances_) {
-        (void)id;
-        if (instance) instances.push_back(instance);
-      }
-    }
-
-    for (const auto& instance : instances) {
+    for (const auto& instance : snapshot_instances()) {
       instance->stop();
     }
   } catch (...) {
@@ -203,10 +181,20 @@ std::shared_ptr<SimulationInstance> SimulationInstanceManager::find_or_throw(
     const std::string& id) const {
   std::lock_guard lock{mutex_};
   auto it = instances_.find(id);
-  if (it == instances_.end() || !it->second) {
-    throw std::out_of_range("instance not found: " + id);
-  }
+  if (it == instances_.end()) throw std::out_of_range("instance not found: " + id);
   return it->second;
+}
+
+std::vector<std::shared_ptr<SimulationInstance>> SimulationInstanceManager::snapshot_instances()
+    const {
+  std::lock_guard lock{mutex_};
+  std::vector<std::shared_ptr<SimulationInstance>> out;
+  out.reserve(instances_.size());
+  for (const auto& [id, instance] : instances_) {
+    (void)id;
+    out.push_back(instance);
+  }
+  return out;
 }
 
 std::string SimulationInstanceManager::require_id(const nlohmann::json& data) {

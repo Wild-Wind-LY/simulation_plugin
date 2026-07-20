@@ -169,47 +169,27 @@ void SimulationPlug::on_unload() noexcept {
 }
 
 JsonRpcResult SimulationPlug::handle_scene_load(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("scene loaded", scenes_.load(data));
-  } catch (const std::exception& e) {
-    return route_error("scene.load", e);
-  }
+  return dispatch("scene.load", "scene loaded", [&] { return scenes_.load(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_scene_create(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("scene created", scenes_.create(data));
-  } catch (const std::exception& e) {
-    return route_error("scene.create", e);
-  }
+  return dispatch("scene.create", "scene created", [&] { return scenes_.create(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_scene_save(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("scene saved", scenes_.save(data));
-  } catch (const std::exception& e) {
-    return route_error("scene.save", e);
-  }
+  return dispatch("scene.save", "scene saved", [&] { return scenes_.save(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_scene_unload(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("scene unloaded", scenes_.unload(data));
-  } catch (const std::exception& e) {
-    return route_error("scene.unload", e);
-  }
+  return dispatch("scene.unload", "scene unloaded", [&] { return scenes_.unload(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_scene_update(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("scene updated", scenes_.update(data));
-  } catch (const std::exception& e) {
-    return route_error("scene.update", e);
-  }
+  return dispatch("scene.update", "scene updated", [&] { return scenes_.update(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_scene_apply(const nlohmann::json& data) {
-  try {
+  return dispatch_result("scene.apply", [&]() -> JsonRpcResult {
     const std::string scene_id = data.value("scene_id", data.value("id", ""));
     const std::string instance_id = data.value("instance_id", data.value("id", ""));
     if (scene_id.empty()) throw std::invalid_argument("missing 'scene_id' or 'id'");
@@ -262,40 +242,30 @@ JsonRpcResult SimulationPlug::handle_scene_apply(const nlohmann::json& data) {
     result["mode"] = "runtime";
     result["state"] = state;
     return JsonRpcResult::ok("scene applied at runtime", std::move(result));
-  } catch (const std::exception& e) {
-    return route_error("scene.apply", e);
-  }
+  });
 }
+
 JsonRpcResult SimulationPlug::handle_scene_list(const nlohmann::json& data) {
-  try {
+  return dispatch("scene.list", "scene list", [&] {
     (void)data;
-    return JsonRpcResult::ok("scene list", scenes_.list());
-  } catch (const std::exception& e) {
-    return route_error("scene.list", e);
-  }
+    return scenes_.list();
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_scene_info(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("scene info", scenes_.info(data));
-  } catch (const std::exception& e) {
-    return route_error("scene.info", e);
-  }
+  return dispatch("scene.info", "scene info", [&] { return scenes_.info(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_scene_validate(const nlohmann::json& data) {
-  try {
+  return dispatch("scene.validate", "scene validation", [&] {
     nlohmann::json scene = data;
     if (data.contains("id") && data["id"].is_string()) scene = scenes_.info(data);
-    return JsonRpcResult::ok("scene validation",
-                             compiler_.validate_scene(resolve_scene_models(scene)));
-  } catch (const std::exception& e) {
-    return route_error("scene.validate", e);
-  }
+    return compiler_.validate_scene(resolve_scene_models(scene));
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_scene_diff(const nlohmann::json& data) {
-  try {
+  return dispatch("scene.diff", "scene diff", [&] {
     nlohmann::json old_scene;
     nlohmann::json new_scene;
     if (data.contains("old_scene") && data.contains("new_scene")) {
@@ -310,13 +280,12 @@ JsonRpcResult SimulationPlug::handle_scene_diff(const nlohmann::json& data) {
       old_scene = scenes_.info({{"id", from}});
       new_scene = scenes_.info({{"id", to}});
     }
-    return JsonRpcResult::ok("scene diff", compiler_.diff_scenes(old_scene, new_scene));
-  } catch (const std::exception& e) {
-    return route_error("scene.diff", e);
-  }
+    return compiler_.diff_scenes(old_scene, new_scene);
+  });
 }
+
 JsonRpcResult SimulationPlug::handle_scene_compile(const nlohmann::json& data) {
-  try {
+  return dispatch("scene.compile", "scene compiled", [&] {
     const auto scene = scenes_.info(data);
     auto result = compiler_.compile_scene(resolve_scene_models(scene));
     // include_visual: 无需创建实例即可拿到编译几何，编辑器用它渲染真实模型。
@@ -341,25 +310,20 @@ JsonRpcResult SimulationPlug::handle_scene_compile(const nlohmann::json& data) {
         }
       }
     }
-    return JsonRpcResult::ok("scene compiled", std::move(result));
-  } catch (const std::exception& e) {
-    return route_error("scene.compile", e);
-  }
+    return result;
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_scene_export(const nlohmann::json& data) {
-  try {
+  return dispatch("scene.export", "scene exported", [&] {
     const auto scene = scenes_.info(data);
-    return JsonRpcResult::ok("scene exported", compiler_.export_scene(resolve_scene_models(scene),
-                                                                      data.value("out_dir", ""),
-                                                                      data.value("flatten", true)));
-  } catch (const std::exception& e) {
-    return route_error("scene.export", e);
-  }
+    return compiler_.export_scene(resolve_scene_models(scene), data.value("out_dir", ""),
+                                  data.value("flatten", true));
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_visual_scene(const nlohmann::json& data) {
-  try {
+  return dispatch("visual.scene", "visual scene", [&] {
     nlohmann::json scene;
     if (data.contains("scene") && data["scene"].is_object()) {
       scene = data["scene"];
@@ -368,23 +332,16 @@ JsonRpcResult SimulationPlug::handle_visual_scene(const nlohmann::json& data) {
       if (!lookup.contains("id") && lookup.contains("scene_id")) lookup["id"] = lookup["scene_id"];
       scene = scenes_.info(lookup);
     }
-    return JsonRpcResult::ok("visual scene",
-                             compiler_.build_visual_scene(resolve_scene_models(scene)));
-  } catch (const std::exception& e) {
-    return route_error("visual.scene", e);
-  }
+    return compiler_.build_visual_scene(resolve_scene_models(scene));
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_visual_model(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("visual model", instances_.visual_model(data));
-  } catch (const std::exception& e) {
-    return route_error("visual.model", e);
-  }
+  return dispatch("visual.model", "visual model", [&] { return instances_.visual_model(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_instance_create(const nlohmann::json& data) {
-  try {
+  return dispatch("instance.create", "instance created", [&] {
     auto config = data;
     SimulationCompiler::ModelPtr shared_model;
     const std::string scene_id = data.value("scene_id", "");
@@ -400,14 +357,12 @@ JsonRpcResult SimulationPlug::handle_instance_create(const nlohmann::json& data)
     }
     auto state = instances_.create(config, std::move(shared_model));
     publish_state(state);
-    return JsonRpcResult::ok("instance created", std::move(state));
-  } catch (const std::exception& e) {
-    return route_error("instance.create", e);
-  }
+    return state;
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_instance_recreate_from_scene(const nlohmann::json& data) {
-  try {
+  return dispatch("instance.recreate_from_scene", "instance recreated from scene", [&] {
     const std::string scene_id = data.value("scene_id", "");
     if (scene_id.empty()) throw std::invalid_argument("missing 'scene_id'");
     auto scene = scenes_.info({{"id", scene_id}});
@@ -425,98 +380,77 @@ JsonRpcResult SimulationPlug::handle_instance_recreate_from_scene(const nlohmann
       result["state"] = state;
       publish_state(state);
     }
-    return JsonRpcResult::ok("instance recreated from scene", std::move(result));
-  } catch (const std::exception& e) {
-    return route_error("instance.recreate_from_scene", e);
-  }
+    return result;
+  });
 }
+
 JsonRpcResult SimulationPlug::handle_instance_start(const nlohmann::json& data) {
-  try {
+  return dispatch("instance.start", "instance started", [&] {
     auto state = instances_.start(
         data, [this](const nlohmann::json& snapshot) { publish_state(snapshot); });
     publish_state(state);
-    return JsonRpcResult::ok("instance started", std::move(state));
-  } catch (const std::exception& e) {
-    return route_error("instance.start", e);
-  }
+    return state;
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_instance_pause(const nlohmann::json& data) {
-  try {
+  return dispatch("instance.pause", "instance paused", [&] {
     auto state = instances_.pause(data);
     publish_state(state);
-    return JsonRpcResult::ok("instance paused", std::move(state));
-  } catch (const std::exception& e) {
-    return route_error("instance.pause", e);
-  }
+    return state;
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_instance_stop(const nlohmann::json& data) {
-  try {
+  return dispatch("instance.stop", "instance stopped", [&] {
     auto state = instances_.stop(data);
     publish_state(state);
-    return JsonRpcResult::ok("instance stopped", std::move(state));
-  } catch (const std::exception& e) {
-    return route_error("instance.stop", e);
-  }
+    return state;
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_instance_step(const nlohmann::json& data) {
-  try {
+  return dispatch("instance.step", "instance stepped", [&] {
     auto state = instances_.step(data);
     publish_state(state);
-    return JsonRpcResult::ok("instance stepped", std::move(state));
-  } catch (const std::exception& e) {
-    return route_error("instance.step", e);
-  }
+    return state;
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_instance_reset(const nlohmann::json& data) {
-  try {
+  return dispatch("instance.reset", "instance reset", [&] {
     auto state = instances_.reset(data);
     publish_state(state);
-    return JsonRpcResult::ok("instance reset", std::move(state));
-  } catch (const std::exception& e) {
-    return route_error("instance.reset", e);
-  }
+    return state;
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_instance_apply_runtime(const nlohmann::json& data) {
-  try {
+  return dispatch("instance.apply_runtime", "instance runtime applied", [&] {
     auto state = instances_.apply_runtime(data);
     publish_state(state);
-    return JsonRpcResult::ok("instance runtime applied", std::move(state));
-  } catch (const std::exception& e) {
-    return route_error("instance.apply_runtime", e);
-  }
+    return state;
+  });
 }
+
 JsonRpcResult SimulationPlug::handle_instance_state(const nlohmann::json& data) {
-  try {
-    auto state = instances_.state(data);
-    return JsonRpcResult::ok("instance state", std::move(state));
-  } catch (const std::exception& e) {
-    return route_error("instance.state", e);
-  }
+  return dispatch("instance.state", "instance state", [&] { return instances_.state(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_instance_metadata(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("instance metadata", instances_.metadata(data));
-  } catch (const std::exception& e) {
-    return route_error("instance.metadata", e);
-  }
+  return dispatch("instance.metadata", "instance metadata",
+                  [&] { return instances_.metadata(data); });
 }
+
 JsonRpcResult SimulationPlug::handle_instance_list(const nlohmann::json& data) {
-  try {
+  return dispatch("instance.list", "instance list", [&] {
     (void)data;
-    return JsonRpcResult::ok("instance list", instances_.list());
-  } catch (const std::exception& e) {
-    return route_error("instance.list", e);
-  }
+    return instances_.list();
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_instance_destroy(const nlohmann::json& data) {
-  try {
+  return dispatch("instance.destroy", "instance destroyed", [&] {
     auto result = instances_.destroy(data);
     nlohmann::json event = {
         {"id", result.value("id", "")},
@@ -524,39 +458,28 @@ JsonRpcResult SimulationPlug::handle_instance_destroy(const nlohmann::json& data
         {"destroyed", true},
     };
     publish_state(event);
-    return JsonRpcResult::ok("instance destroyed", std::move(result));
-  } catch (const std::exception& e) {
-    return route_error("instance.destroy", e);
-  }
+    return result;
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_model_register(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("model registered", model_registry_.register_model(data));
-  } catch (const std::exception& e) {
-    return route_error("model.register", e);
-  }
+  return dispatch("model.register", "model registered",
+                  [&] { return model_registry_.register_model(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_model_list(const nlohmann::json& data) {
-  try {
+  return dispatch("model.list", "model list", [&] {
     (void)data;
-    return JsonRpcResult::ok("model list", model_registry_.list());
-  } catch (const std::exception& e) {
-    return route_error("model.list", e);
-  }
+    return model_registry_.list();
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_model_info(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("model info", model_registry_.info(data));
-  } catch (const std::exception& e) {
-    return route_error("model.info", e);
-  }
+  return dispatch("model.info", "model info", [&] { return model_registry_.info(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_model_visual(const nlohmann::json& data) {
-  try {
+  return dispatch("model.visual", "model visual", [&] {
     // 独立编译注册资产（不需要场景/实例），返回默认位形（qpos0）的几何。
     // 编辑器用它生成资产库缩略图和首次拖拽的即时预览。
     const auto info = model_registry_.info(data);
@@ -575,14 +498,12 @@ JsonRpcResult SimulationPlug::handle_model_visual(const nlohmann::json& data) {
       result.update(simulation_visual_json(model.get(), tmp, data.value("include_geometry", true)));
       mj_deleteData(tmp);
     }
-    return JsonRpcResult::ok("model visual", std::move(result));
-  } catch (const std::exception& e) {
-    return route_error("model.visual", e);
-  }
+    return result;
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_model_remove(const nlohmann::json& data) {
-  try {
+  return dispatch("model.remove", "model removed", [&] {
     const std::string id = data.value("id", data.value("model_id", ""));
     const std::string version = data.value("version", "");
     std::string latest_version;
@@ -594,162 +515,113 @@ JsonRpcResult SimulationPlug::handle_model_remove(const nlohmann::json& data) {
     }
     if (scenes_.references_model(id, version, latest_version))
       throw std::invalid_argument("model version is referenced by a loaded scene");
-    return JsonRpcResult::ok("model removed", model_registry_.remove(data));
-  } catch (const std::exception& e) {
-    return route_error("model.remove", e);
-  }
+    return model_registry_.remove(data);
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_model_cache_prune(const nlohmann::json& data) {
-  try {
+  return dispatch("model.cache_prune", "model cache pruned", [&] {
     (void)data;
-    return JsonRpcResult::ok("model cache pruned", {{"removed", compiler_.prune_unused_models()}});
-  } catch (const std::exception& e) {
-    return route_error("model.cache_prune", e);
-  }
+    return nlohmann::json{{"removed", compiler_.prune_unused_models()}};
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_model_verify(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("model verified", model_registry_.verify(data));
-  } catch (const std::exception& e) {
-    return route_error("model.verify", e);
-  }
+  return dispatch("model.verify", "model verified", [&] { return model_registry_.verify(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_model_validate(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("model validation", model_validator_.validate(data));
-  } catch (const std::exception& e) {
-    return route_error("model.validate", e);
-  }
+  return dispatch("model.validate", "model validation",
+                  [&] { return model_validator_.validate(data); });
 }
+
 JsonRpcResult SimulationPlug::handle_model_inspect(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("model inspection", instances_.inspect_model(data));
-  } catch (const std::exception& e) {
-    return route_error("model.inspect", e);
-  }
+  return dispatch("model.inspect", "model inspection",
+                  [&] { return instances_.inspect_model(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_control_joint_state(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("joint state", instances_.joint_state(data));
-  } catch (const std::exception& e) {
-    return route_error("control.joint_state", e);
-  }
+  return dispatch("control.joint_state", "joint state",
+                  [&] { return instances_.joint_state(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_control_sensor_state(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("sensor state", instances_.sensor_state(data));
-  } catch (const std::exception& e) {
-    return route_error("control.sensor_state", e);
-  }
+  return dispatch("control.sensor_state", "sensor state",
+                  [&] { return instances_.sensor_state(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_control_write_ctrl(const nlohmann::json& data) {
-  try {
+  return dispatch("control.write_ctrl", "control written", [&] {
     auto state = instances_.write_ctrl(data);
     publish_state(state);
-    return JsonRpcResult::ok("control written", std::move(state));
-  } catch (const std::exception& e) {
-    return route_error("control.write_ctrl", e);
-  }
+    return state;
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_control_write_qpos(const nlohmann::json& data) {
-  try {
+  return dispatch("control.write_qpos", "qpos written", [&] {
     auto state = instances_.write_qpos(data);
     publish_state(state);
-    return JsonRpcResult::ok("qpos written", std::move(state));
-  } catch (const std::exception& e) {
-    return route_error("control.write_qpos", e);
-  }
+    return state;
+  });
 }
+
 JsonRpcResult SimulationPlug::handle_task_create(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("task created", tasks_.create(data));
-  } catch (const std::exception& e) {
-    return route_error("task.create", e);
-  }
+  return dispatch("task.create", "task created", [&] { return tasks_.create(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_task_remove(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("task removed", tasks_.remove(data));
-  } catch (const std::exception& e) {
-    return route_error("task.remove", e);
-  }
+  return dispatch("task.remove", "task removed", [&] { return tasks_.remove(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_task_list(const nlohmann::json& data) {
-  try {
+  return dispatch("task.list", "task list", [&] {
     (void)data;
-    return JsonRpcResult::ok("task list", tasks_.list());
-  } catch (const std::exception& e) {
-    return route_error("task.list", e);
-  }
+    return tasks_.list();
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_task_info(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("task info", tasks_.info(data));
-  } catch (const std::exception& e) {
-    return route_error("task.info", e);
-  }
+  return dispatch("task.info", "task info", [&] { return tasks_.info(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_task_run(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("task done", tasks_.run(data, instances_));
-  } catch (const std::exception& e) {
-    return route_error("task.run", e);
-  }
+  return dispatch("task.run", "task done", [&] { return tasks_.run(data, instances_); });
 }
+
 JsonRpcResult SimulationPlug::handle_record_start(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("record started", records_.start(data, instances_));
-  } catch (const std::exception& e) {
-    return route_error("record.start", e);
-  }
+  return dispatch("record.start", "record started",
+                  [&] { return records_.start(data, instances_); });
 }
 
 JsonRpcResult SimulationPlug::handle_record_stop(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("record stopped", records_.stop(data));
-  } catch (const std::exception& e) {
-    return route_error("record.stop", e);
-  }
+  return dispatch("record.stop", "record stopped", [&] { return records_.stop(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_record_list(const nlohmann::json& data) {
-  try {
+  return dispatch("record.list", "record list", [&] {
     (void)data;
-    return JsonRpcResult::ok("record list", records_.list());
-  } catch (const std::exception& e) {
-    return route_error("record.list", e);
-  }
+    return records_.list();
+  });
 }
 
 JsonRpcResult SimulationPlug::handle_record_info(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("record info", records_.info(data));
-  } catch (const std::exception& e) {
-    return route_error("record.info", e);
-  }
+  return dispatch("record.info", "record info", [&] { return records_.info(data); });
 }
 
 JsonRpcResult SimulationPlug::handle_record_remove(const nlohmann::json& data) {
-  try {
-    return JsonRpcResult::ok("record removed", records_.remove(data));
-  } catch (const std::exception& e) {
-    return route_error("record.remove", e);
-  }
+  return dispatch("record.remove", "record removed", [&] { return records_.remove(data); });
 }
 JsonRpcResult SimulationPlug::route_error(const char* action, const std::exception& e) const {
   LOG_ERROR("[{}] {} failed: {}", TAG, action, e.what());
-  return JsonRpcResult::error(e.what(), -1, 400);
+  // Managers signal "not found" via std::out_of_range and "bad input" via
+  // std::invalid_argument; map those to 404/400 instead of flattening every
+  // failure to 400 (a missing task.info/record.info id previously came back
+  // as a misleading "bad request").
+  if (dynamic_cast<const std::out_of_range*>(&e)) return JsonRpcResult::error(e.what(), -1, 404);
+  if (dynamic_cast<const std::invalid_argument*>(&e))
+    return JsonRpcResult::error(e.what(), -1, 400);
+  return JsonRpcResult::error(e.what(), -1, 500);
 }
 
 namespace {
@@ -1100,11 +972,41 @@ void SimulationPlug::publish_state(const nlohmann::json& state) noexcept {
     if (!visual_targets.empty()) {
       // 附带 geom 世界位姿（transforms-only），浏览器端按 geom_id 增量更新 3D 预览。
       // 实例刚销毁等竞态下取不到位姿时退化为纯状态推送。
-      try {
-        if (!state.value("destroyed", false)) {
-          event["visual"] = instances_.visual_model({{"id", id}, {"include_geometry", false}});
+      //
+      // Rebuilding this is a full geom-transform walk (visual_model), so a burst of
+      // synchronous RPCs against the same instance (rapid step/write_ctrl/write_qpos
+      // calls, each of which also calls publish_state) is throttled to at most once
+      // per kMinVisualPublishInterval -- independent of how often state itself is
+      // published. Sessions still get the plain state text every call either way.
+      //
+      // kMinVisualPublishInterval must stay below 1 / (max configurable publish_hz).
+      // publish_hz clamps to <= 200 (SimulationInstance::clamp_rate), so worker_loop's
+      // own periodic publish ticks are never spaced closer than ~5ms apart -- this must
+      // not throttle *those* (a fixed 50ms/20Hz window here previously did: at
+      // publish_hz=60 it silently dropped the 'visual' field on 2 of every 3 ticks,
+      // making a smoothly-configured live view visibly choppier than before). Only a
+      // burst *faster* than any legitimate publish_hz (e.g. write_qpos fired on every
+      // mouse 'input' event during a drag) should actually get throttled here.
+      bool rebuild_visual = !state.value("destroyed", false);
+      if (rebuild_visual) {
+        constexpr auto kMinVisualPublishInterval = std::chrono::milliseconds(4);
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(ws_mutex_);
+        auto& last = last_visual_publish_[id];
+        if (now - last < kMinVisualPublishInterval) {
+          rebuild_visual = false;
+        } else {
+          last = now;
         }
-      } catch (...) {
+      } else {
+        std::lock_guard<std::mutex> lock(ws_mutex_);
+        last_visual_publish_.erase(id);
+      }
+      if (rebuild_visual) {
+        try {
+          event["visual"] = instances_.visual_model({{"id", id}, {"include_geometry", false}});
+        } catch (...) {
+        }
       }
       const std::string text = event.dump();
       for (const auto& session_id : visual_targets)

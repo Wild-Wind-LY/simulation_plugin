@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -101,6 +102,28 @@ private:
   nlohmann::json resolve_scene_models(const nlohmann::json& scene) const;
   void publish_state(const nlohmann::json& state) noexcept;
 
+  // Almost every handle_* method is: try { return JsonRpcResult::ok(msg, <one
+  // call>); } catch (const std::exception& e) { return route_error(action, e); }.
+  // `dispatch` collapses that shape to one line; `fn` may contain any number of
+  // statements as long as it ends in one `return <json-convertible value>`.
+  template <typename Fn>
+  JsonRpcResult dispatch(const char* action, std::string ok_message, Fn&& fn) {
+    try {
+      return JsonRpcResult::ok(std::move(ok_message), fn());
+    } catch (const std::exception& e) {
+      return route_error(action, e);
+    }
+  }
+  // For the rare handler (scene.apply) with more than one distinct success
+  // shape/message: `fn` returns the JsonRpcResult directly.
+  template <typename Fn> JsonRpcResult dispatch_result(const char* action, Fn&& fn) {
+    try {
+      return fn();
+    } catch (const std::exception& e) {
+      return route_error(action, e);
+    }
+  }
+
 private:
   struct WsSubscription {
     std::unordered_set<std::string> instances;  // 含 "*" 表示订阅全部实例
@@ -111,6 +134,12 @@ private:
   std::shared_ptr<const JsonRpcRouter::RouteMap> routes_;
   std::mutex ws_mutex_;
   std::unordered_map<std::string, WsSubscription> ws_subscriptions_;
+  // Per-instance last time publish_state() rebuilt the geom-transform payload for
+  // visual-subscribed sessions, so a burst of RPCs against one instance (rapid
+  // instance.step/write_ctrl/write_qpos calls) doesn't each pay for a full
+  // visual_model() rebuild -- capped independently of how often state itself is
+  // published. Guarded by `ws_mutex_`.
+  std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_visual_publish_;
   std::atomic_uint64_t ws_send_failures_{0};
   SimulationSceneManager scenes_;
   SimulationModelRegistry model_registry_;

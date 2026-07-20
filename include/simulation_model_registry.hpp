@@ -65,10 +65,20 @@ private:
   nlohmann::json resolve_locked(const std::string& id, const std::string& version) const;
   nlohmann::json integrity_status(const nlohmann::json& entry) const;
   void load_manifest();
-  void save_manifest_locked() const;
+  // Builds the {schema, models} manifest JSON from `entries_`. Called under
+  // `mutex_` -- cheap (no I/O), so it doesn't hold up other registry ops.
+  nlohmann::json snapshot_manifest_locked() const;
+  // Actually writes `manifest` to disk. Called *without* `mutex_` held (so
+  // list()/info()/verify()/resolve_scene() aren't blocked for the write's
+  // duration) -- serialized instead by `manifest_io_mutex_`, with `generation`
+  // used to drop a write that's older than one that already landed.
+  void persist_manifest(nlohmann::json manifest, uint64_t generation) const;
 
   std::filesystem::path storage_dir_;
   std::filesystem::path manifest_path_;
   mutable std::mutex mutex_;
   std::unordered_map<std::string, nlohmann::json> entries_;
+  mutable std::mutex manifest_io_mutex_;
+  mutable uint64_t manifest_generation_{0};
+  mutable uint64_t last_written_generation_{0};
 };

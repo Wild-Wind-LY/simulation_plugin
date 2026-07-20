@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 
@@ -12,3 +13,17 @@ std::filesystem::path simulation_data_root();
 // 迁移失败（跨设备等）时沿用旧目录，保证不丢数据。目录本身不在此创建，
 // 由调用方按需 create_directories。
 std::filesystem::path simulation_data_dir(const std::string& name, const std::string& legacy_name);
+
+namespace simulation {
+
+  // Recursively copies `from` into `to`, preserving relative structure. Skips
+  // symlinks and VCS directories (.git/.svn/.hg). If `max_bytes` and/or
+  // `max_files` are non-zero, pre-scans `from` first and throws
+  // std::invalid_argument without copying anything if either cap is exceeded.
+  // Shared by the model registry's asset-package snapshot and scene export's
+  // asset bundling so both enforce the same caps/skip rules instead of each
+  // reimplementing (and potentially drifting from) this independently.
+  void copy_directory_tree(const std::filesystem::path& from, const std::filesystem::path& to,
+                           uint64_t max_bytes = 0, uint64_t max_files = 0);
+
+}  // namespace simulation

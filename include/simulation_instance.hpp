@@ -42,7 +42,7 @@ public:
   nlohmann::json start(double step_hz, double publish_hz, PublishFn publisher);
   nlohmann::json pause();
   nlohmann::json stop();
-  nlohmann::json step(int count);
+  nlohmann::json step(int count, bool include_state = true);
   nlohmann::json reset();
   nlohmann::json apply_runtime(const nlohmann::json& data);
   nlohmann::json state() const;
@@ -64,7 +64,7 @@ private:
 
   void worker_loop(PublishFn publisher);
   void request_worker_stop();
-  nlohmann::json state_locked() const;
+  nlohmann::json state_locked(bool include_arrays = true) const;
   nlohmann::json metadata_locked() const;
   nlohmann::json joint_state_locked() const;
   nlohmann::json sensor_state_locked() const;
@@ -83,6 +83,10 @@ private:
   double step_hz_{100.0};
   double publish_hz_{10.0};
   bool stop_requested_{false};
+  // Set whenever qpos/qvel is written directly (configure/apply_runtime/reset/write_qpos);
+  // mj_step already leaves poses consistent, so visual_model_locked() only re-forwards
+  // when this is set, instead of on every single call.
+  mutable bool needs_forward_{true};
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::thread worker_;

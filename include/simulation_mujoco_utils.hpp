@@ -7,6 +7,14 @@
 #include <mutex>
 #include <string>
 
+// Process-wide: every mj_loadXML / mj_saveLastXML call in the plugin (model
+// registration, scene compile, URDF conversion, scene export) takes this same
+// lock, so two concurrent compiles never run in parallel even on a multi-core
+// host -- each waits out the other's full compile time. It stays a single
+// global lock rather than something narrower because MuJoCo's XML compiler
+// was not verified here to be safe for concurrent use from multiple threads;
+// narrowing this without confirming that first would trade a known perf cost
+// for a data race that would only show up intermittently under real concurrency.
 inline std::mutex& simulation_mujoco_xml_mutex() {
   static std::mutex mutex;
   return mutex;

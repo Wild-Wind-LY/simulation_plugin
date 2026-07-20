@@ -152,21 +152,30 @@ nlohmann::json SimulationSceneManager::unload(const nlohmann::json& data) {
 }
 
 nlohmann::json SimulationSceneManager::list() const {
-  std::lock_guard lock{mutex_};
+  // Build the in-memory portion under the lock (cheap: just a map walk), then
+  // release it before the directory scan/JSON parsing below -- those do disk I/O
+  // and previously held `mutex_` for their whole duration, blocking every other
+  // scene op (create/save/update/unload/info/references_model all take the same
+  // lock) until the scan finished. A scene loaded/unloaded concurrently mid-scan
+  // just means this best-effort listing may lag by one call; it isn't used for
+  // anything that needs strict consistency.
   nlohmann::json out = nlohmann::json::array();
   std::set<std::string> listed_ids;
   std::set<std::string> listed_paths;
-  for (const auto& [id, scene] : scenes_) {
-    out.push_back({
-        {"id", id},
-        {"name", scene.value("name", id)},
-        {"model_count", scene.value("models", nlohmann::json::array()).size()},
-        {"path", scene.value("path", "")},
-        {"loaded", true},
-    });
-    listed_ids.insert(id);
-    const std::string path = scene.value("path", "");
-    if (!path.empty()) listed_paths.insert(path);
+  {
+    std::lock_guard lock{mutex_};
+    for (const auto& [id, scene] : scenes_) {
+      out.push_back({
+          {"id", id},
+          {"name", scene.value("name", id)},
+          {"model_count", scene.value("models", nlohmann::json::array()).size()},
+          {"path", scene.value("path", "")},
+          {"loaded", true},
+      });
+      listed_ids.insert(id);
+      const std::string path = scene.value("path", "");
+      if (!path.empty()) listed_paths.insert(path);
+    }
   }
   // 默认场景目录里的 JSON 文件也列出来（loaded:false）：网关重启清空内存后，
   // 编辑器仍能发现保存过的场景并按 path 重新 scene.load。

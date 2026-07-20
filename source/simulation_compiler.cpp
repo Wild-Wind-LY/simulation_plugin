@@ -388,18 +388,32 @@ nlohmann::json SimulationCompiler::compile_scene(const nlohmann::json& scene) co
     throw std::invalid_argument("scene validation failed: " + validation["errors"].dump());
   }
 
-  const auto compiled_model_path = write_compiled_mjcf(scene);
+  // structural_model_id already folds in the scene id, structural signature and
+  // every referenced model file's mtime, so it changes whenever the compiled
+  // output would change. Check the cache with it *before* doing any of the
+  // expensive XML-generation/disk-write/model-load work below, so a cache hit
+  // (the common case: repeated instance.create/scene.apply against an
+  // unchanged scene) skips all of it instead of redoing it and discarding the
+  // result.
   const std::string compiled_model_id = structural_model_id(scene);
   ModelPtr model;
+  std::filesystem::path compiled_model_path;
   {
     std::lock_guard lock{model_mutex_};
     auto it = models_.find(compiled_model_id);
-    if (it != models_.end()) model = touch_and_reclaim_locked(compiled_model_id, it->second.model);
+    if (it != models_.end()) {
+      model = touch_and_reclaim_locked(compiled_model_id, it->second.model);
+      compiled_model_path = it->second.compiled_path;
+    }
   }
   if (!model) {
+    // Name the file by the content-derived compiled_model_id (not just the scene id) so
+    // two concurrent compiles of the same scene id with different content can never race
+    // on the same path -- one overwriting mid-read by the other.
+    compiled_model_path = write_compiled_mjcf(scene, compiled_model_id);
     auto loaded = load_model(compiled_model_path);
     std::lock_guard lock{model_mutex_};
-    model = touch_and_reclaim_locked(compiled_model_id, std::move(loaded));
+    model = touch_and_reclaim_locked(compiled_model_id, std::move(loaded), compiled_model_path);
   }
 
   nlohmann::json compiled;
@@ -657,10 +671,11 @@ std::string SimulationCompiler::structural_model_id(const nlohmann::json& scene)
 }
 
 SimulationCompiler::ModelPtr SimulationCompiler::touch_and_reclaim_locked(
-    const std::string& model_id, ModelPtr model) const {
+    const std::string& model_id, ModelPtr model, std::filesystem::path compiled_path) const {
   auto& entry = models_[model_id];
   entry.model = std::move(model);
   entry.last_used = ++access_tick_;
+  if (!compiled_path.empty()) entry.compiled_path = std::move(compiled_path);
   ModelPtr result = entry.model;
 
   // Evict least-recently-used entries that no live instance still references
@@ -1020,14 +1035,14 @@ std::string SimulationCompiler::generate_scene_xml(
   return xml;
 }
 
-std::filesystem::path SimulationCompiler::write_compiled_mjcf(const nlohmann::json& scene) const {
+std::filesystem::path SimulationCompiler::write_compiled_mjcf(
+    const nlohmann::json& scene, const std::string& compiled_model_id) const {
   const std::string xml = generate_scene_xml(
       scene,
       [](const nlohmann::json&, const std::filesystem::path& source) { return source.string(); });
 
   std::filesystem::create_directories(output_dir_);
-  const auto output_path
-      = output_dir_ / (scene.value("id", "scene") + std::string(".compiled.xml"));
+  const auto output_path = output_dir_ / (compiled_model_id + ".compiled.xml");
   std::ofstream output(output_path);
   if (!output) throw std::runtime_error("failed to write compiled model: " + output_path.string());
   output << xml;
@@ -1044,28 +1059,6 @@ namespace {
       out.push_back((std::isalnum(c) || c == '_' || c == '-' || c == '.') ? static_cast<char>(c)
                                                                           : '_');
     return out.empty() ? std::string{"model"} : out;
-  }
-
-  void copy_tree(const std::filesystem::path& from, const std::filesystem::path& to) {
-    namespace fs = std::filesystem;
-    fs::create_directories(to);
-    for (auto it
-         = fs::recursive_directory_iterator(from, fs::directory_options::skip_permission_denied);
-         it != fs::recursive_directory_iterator(); ++it) {
-      if (it->is_symlink()) continue;
-      const auto rel = fs::relative(it->path(), from);
-      const auto dest = to / rel;
-      std::error_code ec;
-      if (it->is_directory()) {
-        fs::create_directories(dest, ec);
-      } else if (it->is_regular_file()) {
-        fs::create_directories(dest.parent_path(), ec);
-        fs::copy_file(it->path(), dest, fs::copy_options::overwrite_existing, ec);
-        if (ec)
-          throw std::runtime_error("failed to copy asset " + it->path().string() + ": "
-                                   + ec.message());
-      }
-    }
   }
 
   // First regular file under any root whose filename matches `basename`. Used to
@@ -1138,7 +1131,12 @@ nlohmann::json SimulationCompiler::export_scene(const nlohmann::json& scene,
 
       const std::string folder = std::to_string(index++) + "_" + sanitize_folder(id);
       const fs::path dest = assets_dir / folder;
-      copy_tree(pkg, dest);
+      // Same caps registration enforces on this package (max_asset_bytes' default,
+      // and the same file-count ceiling) -- export bundling must not be able to
+      // copy something the registry itself would have rejected or skipped.
+      constexpr uint64_t kMaxExportBytes = static_cast<uint64_t>(1) << 30;
+      constexpr uint64_t kMaxExportFiles = 50000;
+      simulation::copy_directory_tree(pkg, dest, kMaxExportBytes, kMaxExportFiles);
       const fs::path file_rel = fs::path("assets") / folder / fs::relative(source, pkg);
       bundled.push_back(
           {{"id", id}, {"file", file_rel.generic_string()}, {"package", pkg.string()}});
