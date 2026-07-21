@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -15,6 +16,7 @@
 #include "simulation_hash.hpp"
 #include "simulation_mujoco_utils.hpp"
 #include "simulation_paths.hpp"
+#include "simulation_scene_refs.hpp"
 
 namespace {
 
@@ -28,6 +30,74 @@ namespace {
     return std::all_of(value.begin(), value.end(), [](unsigned char c) {
       return std::isalnum(c) || c == '_' || c == '-' || c == '.';
     });
+  }
+
+  // Best-effort projection of an arbitrary string (an XML attribute value, a
+  // filename stem) onto the safe_identifier charset: unsupported characters
+  // are dropped, runs of whitespace collapse to a single '_', and leading/
+  // trailing separators are trimmed so the result can't collide with "." or
+  // "..". Returns "" if nothing usable survives -- callers must check that.
+  std::string sanitize_identifier_token(const std::string& text) {
+    std::string out;
+    for (const unsigned char ch : text) {
+      if (std::isalnum(ch) || ch == '_' || ch == '-' || ch == '.') {
+        out.push_back(static_cast<char>(ch));
+      } else if (std::isspace(ch) && !out.empty() && out.back() != '_') {
+        out.push_back('_');
+      }
+    }
+    while (!out.empty() && (out.front() == '.' || out.front() == '-')) out.erase(out.begin());
+    while (!out.empty() && (out.back() == '.' || out.back() == '-' || out.back() == '_'))
+      out.pop_back();
+    return out;
+  }
+
+  // Finds the `attribute="value"` (or '...') pair inside the opening tag
+  // named `tag` (e.g. "<mujoco", "<robot"), searching only up to that tag's
+  // closing '>' so it can't match an attribute belonging to some later,
+  // unrelated element.
+  std::optional<std::string> extract_xml_attribute(const std::string& head, const std::string& tag,
+                                                   const std::string& attribute) {
+    const auto tag_pos = head.find(tag);
+    if (tag_pos == std::string::npos) return std::nullopt;
+    const auto tag_end = head.find('>', tag_pos);
+    const auto region = tag_end != std::string::npos ? head.substr(tag_pos, tag_end - tag_pos)
+                                                     : head.substr(tag_pos);
+    for (const char quote : {'"', '\''}) {
+      const std::string needle = attribute + "=" + quote;
+      const auto attr_pos = region.find(needle);
+      if (attr_pos == std::string::npos) continue;
+      const auto value_start = attr_pos + needle.size();
+      const auto value_end = region.find(quote, value_start);
+      if (value_end == std::string::npos) continue;
+      return region.substr(value_start, value_end - value_start);
+    }
+    return std::nullopt;
+  }
+
+  // Infers a model id when the caller didn't supply one: prefer the model's
+  // own declared name (MJCF `<mujoco model="...">` / URDF `<robot name="...">`)
+  // so drag-and-drop registration lines up with what the asset calls itself,
+  // falling back to the file's stem. Throws rather than guessing something
+  // that would collide or violate safe_identifier, since a wrong silent guess
+  // is worse than asking the caller to be explicit.
+  std::string infer_model_id(const std::filesystem::path& path, const std::string& format) {
+    std::ifstream input(path, std::ios::binary);
+    if (input) {
+      std::string head(8192, '\0');
+      input.read(head.data(), static_cast<std::streamsize>(head.size()));
+      head.resize(static_cast<size_t>(input.gcount()));
+      const auto attr = format == "urdf" ? extract_xml_attribute(head, "<robot", "name")
+                                         : extract_xml_attribute(head, "<mujoco", "model");
+      if (attr) {
+        const auto sanitized = sanitize_identifier_token(*attr);
+        if (safe_identifier(sanitized)) return sanitized;
+      }
+    }
+    const auto sanitized = sanitize_identifier_token(path.stem().string());
+    if (safe_identifier(sanitized)) return sanitized;
+    throw std::invalid_argument(
+        "could not infer model 'id' from file content or filename; specify 'id' explicitly");
   }
 
   // ----------------------------- semver ----------------------------------
@@ -86,6 +156,37 @@ namespace {
     return true;
   }
 
+  // Lets register_model() take a directory as `path` (e.g. a robot's asset
+  // folder dropped in as-is) by locating the single model file inside it.
+  // Non-recursive: the top-level model file is expected to sit alongside its
+  // meshes/textures subfolders, not buried inside one of them.
+  std::filesystem::path find_model_file_in_directory(const std::filesystem::path& dir) {
+    std::vector<std::filesystem::path> candidates;
+    std::error_code ec;
+    for (const auto& dir_entry : std::filesystem::directory_iterator(dir, ec)) {
+      if (!dir_entry.is_regular_file()) continue;
+      auto ext = dir_entry.path().extension().string();
+      std::transform(ext.begin(), ext.end(), ext.begin(),
+                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      if (ext == ".xml" || ext == ".urdf" || ext == ".mjcf") candidates.push_back(dir_entry.path());
+    }
+    if (candidates.empty())
+      throw std::invalid_argument("no model file (.xml/.urdf/.mjcf) found in directory: "
+                                  + dir.string());
+    if (candidates.size() > 1) {
+      std::sort(candidates.begin(), candidates.end());
+      std::string list;
+      for (const auto& candidate : candidates) {
+        if (!list.empty()) list += ", ";
+        list += candidate.filename().string();
+      }
+      throw std::invalid_argument("multiple candidate model files found in directory "
+                                  + dir.string() + " (" + list
+                                  + "); specify 'path' to the exact model file");
+    }
+    return candidates.front();
+  }
+
   // Inspect a compiled model and report robot-relevant metadata / warnings.
   nlohmann::json inspect_compiled_model(const mjModel* model, const std::string& format) {
     nlohmann::json warnings = nlohmann::json::array();
@@ -120,7 +221,7 @@ SimulationModelRegistry::SimulationModelRegistry(std::filesystem::path storage_d
 }
 
 nlohmann::json SimulationModelRegistry::register_model(const nlohmann::json& data) {
-  const std::string id = data.value("id", data.value("model_id", ""));
+  std::string id = data.value("id", data.value("model_id", ""));
   const std::string version = data.value("version", "1");
   const std::string path_text = data.value("path", data.value("model_path", ""));
   const bool replace = data.value("replace", false);
@@ -129,7 +230,7 @@ nlohmann::json SimulationModelRegistry::register_model(const nlohmann::json& dat
   const uint64_t max_asset_bytes
       = data.value("max_asset_bytes", static_cast<uint64_t>(1) << 30);  // 1 GiB default
 
-  if (!safe_identifier(id))
+  if (!id.empty() && !safe_identifier(id))
     throw std::invalid_argument(
         "model 'id' may only contain letters, digits, '.', '_', '-' "
         "and must not be '.' or '..'");
@@ -139,12 +240,17 @@ nlohmann::json SimulationModelRegistry::register_model(const nlohmann::json& dat
         "and must not be '.' or '..'");
   if (path_text.empty()) throw std::invalid_argument("missing model 'path'");
 
-  const auto source = normalize_path(path_text);
+  auto source = normalize_path(path_text);
   if (!std::filesystem::exists(source))
     throw std::invalid_argument("model path does not exist: " + source.string());
+  // A directory drop: locate the single model file inside it so `asset_root`
+  // (below) still defaults to the whole folder, meshes/textures included.
+  if (std::filesystem::is_directory(source)) source = find_model_file_in_directory(source);
   const std::string format = simulation_detect_model_format(source);
   if (format != "mjcf" && format != "urdf")
     throw std::invalid_argument("unsupported model format: " + format);
+
+  if (id.empty()) id = infer_model_id(source, format);
 
   const auto entry_key = key(id, version);
   {
@@ -351,10 +457,8 @@ nlohmann::json SimulationModelRegistry::verify(const nlohmann::json& data) const
 }
 
 nlohmann::json SimulationModelRegistry::resolve_scene(nlohmann::json scene) const {
-  if (!scene.contains("models") || !scene["models"].is_array()) return scene;
   std::lock_guard lock{mutex_};
-  for (auto& model : scene["models"]) {
-    if (!model.is_object() || !model.contains("model_id")) continue;
+  simulation::walk_model_references(scene, [&](nlohmann::json& model) {
     const auto entry = resolve_locked(model.value("model_id", ""), model.value("version", ""));
     model["source"] = effective_abs(entry).string();
     model["resolved_version"] = entry.value("version", "");
@@ -364,7 +468,7 @@ nlohmann::json SimulationModelRegistry::resolve_scene(nlohmann::json scene) cons
       model["package_dir"]
           = package_dir(entry.value("id", ""), entry.value("version", "")).string();
     if (model.value("id", "").empty()) model["id"] = model.value("model_id", "");
-  }
+  });
   return scene;
 }
 

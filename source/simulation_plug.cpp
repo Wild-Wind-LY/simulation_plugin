@@ -234,7 +234,9 @@ JsonRpcResult SimulationPlug::handle_scene_apply(const nlohmann::json& data) {
       return JsonRpcResult::ok("scene applied with recreate", std::move(result));
     }
 
-    nlohmann::json runtime = updated_scene.value("defaults", nlohmann::json::object());
+    nlohmann::json runtime = updated_scene.contains("initial_state")
+                                 ? updated_scene["initial_state"]
+                                 : updated_scene.value("defaults", nlohmann::json::object());
     runtime["id"] = instance_id;
     auto state = instances_.apply_runtime(runtime);
     publish_state(state);
@@ -295,9 +297,12 @@ JsonRpcResult SimulationPlug::handle_scene_compile(const nlohmann::json& data) {
       if (auto model
           = compiler_.get_compiled_model(result.value("compiled_model_id", std::string{}))) {
         if (mjData* tmp = mj_makeData(model.get())) {
-          // 预览应用场景 defaults.qpos，让初始关节角与实例创建后一致（宽容截断，静默跳过非法值）
-          const nlohmann::json defaults = scene.value("defaults", nlohmann::json::object());
-          const nlohmann::json qpos = defaults.value("qpos", nlohmann::json::array());
+          // 预览应用场景
+          // initial_state.qpos，让初始关节角与实例创建后一致（宽容截断，静默跳过非法值）
+          const nlohmann::json initial_state
+              = scene.contains("initial_state") ? scene["initial_state"]
+                                                : scene.value("defaults", nlohmann::json::object());
+          const nlohmann::json qpos = initial_state.value("qpos", nlohmann::json::array());
           if (qpos.is_array() && !qpos.empty()) {
             const int count = std::min<int>(model->nq, static_cast<int>(qpos.size()));
             for (int i = 0; i < count; ++i) {
@@ -727,19 +732,18 @@ PluginHttpResponse SimulationPlug::handle_model_upload(const PluginHttpRequest& 
       return std::string(part->text());
     };
 
+    // 'id' is optional: when omitted, model.register infers it from the
+    // uploaded file's own declared name (MJCF/URDF) or its filename.
     const std::string id = field_text("id");
     std::string version = field_text("version");
     if (version.empty()) version = "1";
-    if (id.empty()) {
-      return to_http_response(JsonRpcResult::error("missing 'id' form field", -1, 400));
-    }
 
     const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::system_clock::now().time_since_epoch())
                             .count();
-    upload_dir
-        = simulation_data_dir("tmp/uploads", "model_uploads")
-          / (safe_dir_token(id) + "_" + safe_dir_token(version) + "_" + std::to_string(now_ms));
+    const std::string dir_id_token = id.empty() ? std::string("upload") : safe_dir_token(id);
+    upload_dir = simulation_data_dir("tmp/uploads", "model_uploads")
+                 / (dir_id_token + "_" + safe_dir_token(version) + "_" + std::to_string(now_ms));
     fs::create_directories(upload_dir);
 
     // 落盘所有文件 part，保留相对子目录结构（meshdir/include 引用可继续解析）

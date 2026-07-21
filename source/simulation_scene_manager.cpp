@@ -7,6 +7,7 @@
 #include <system_error>
 
 #include "simulation_paths.hpp"
+#include "simulation_scene_refs.hpp"
 
 namespace {
 
@@ -15,6 +16,25 @@ namespace {
       return std::filesystem::weakly_canonical(std::filesystem::current_path() / path);
     }
     return std::filesystem::weakly_canonical(path);
+  }
+
+  // Stamps schema_version on every in-memory scene and migrates the legacy
+  // `defaults` (runtime initial state: step_hz/publish_hz/qpos/qvel/ctrl)
+  // field forward to `initial_state`. Starting schema_version 2, `defaults` is
+  // reserved for a future MJCF <default>/class tree, so a scene that predates
+  // schema_version (or is explicitly < 2) has its `defaults` content copied
+  // into `initial_state` once; the original `defaults` key is left in place
+  // untouched (harmless, and lets an old client that still only writes
+  // `defaults` be diagnosed rather than silently misinterpreted).
+  void normalize_schema(nlohmann::json& scene) {
+    const int version = scene.value("schema_version", 1);
+    if (version < 2 && (!scene.contains("initial_state") || !scene["initial_state"].is_object())) {
+      scene["initial_state"] = scene.value("defaults", nlohmann::json::object());
+    }
+    if (!scene.contains("initial_state") || !scene["initial_state"].is_object()) {
+      scene["initial_state"] = nlohmann::json::object();
+    }
+    scene["schema_version"] = 2;
   }
 
 }  // namespace
@@ -32,10 +52,7 @@ nlohmann::json SimulationSceneManager::load(const nlohmann::json& data) {
   if (id.empty()) id = scene_path.stem().string();
   scene["id"] = id;
   scene["path"] = scene_path.string();
-
-  if (!scene.contains("defaults") || !scene["defaults"].is_object()) {
-    scene["defaults"] = nlohmann::json::object();
-  }
+  normalize_schema(scene);
 
   std::lock_guard lock{mutex_};
   scenes_[id] = scene;
@@ -50,7 +67,9 @@ nlohmann::json SimulationSceneManager::create(const nlohmann::json& data) {
                              ? data.at("scene")
                              : nlohmann::json::object();
   for (const char* key :
-       {"name", "physics", "environment", "models", "objects", "sensors", "contacts", "defaults"}) {
+       {"name", "physics", "environment", "models", "objects", "sensors", "contacts", "bodies",
+        "actuators", "equality", "tendon", "keyframes", "assets", "defaultClasses", "initial_state",
+        "defaults", "schema_version"}) {
     if (data.contains(key)) scene[key] = data.at(key);
   }
   scene["id"] = id;
@@ -62,8 +81,7 @@ nlohmann::json SimulationSceneManager::create(const nlohmann::json& data) {
     scene["contacts"] = nlohmann::json::object();
   if (!scene["contacts"].contains("excludes") || !scene["contacts"]["excludes"].is_array())
     scene["contacts"]["excludes"] = nlohmann::json::array();
-  if (!scene.contains("defaults") || !scene["defaults"].is_object())
-    scene["defaults"] = nlohmann::json::object();
+  normalize_schema(scene);
 
   std::lock_guard lock{mutex_};
   if (!replace && scenes_.count(id) != 0)
@@ -136,9 +154,7 @@ nlohmann::json SimulationSceneManager::update(const nlohmann::json& data) {
     scene[item.key()] = item.value();
   }
 
-  if (!scene.contains("defaults") || !scene["defaults"].is_object()) {
-    scene["defaults"] = nlohmann::json::object();
-  }
+  normalize_schema(scene);
 
   it->second = scene;
   return scene;
@@ -232,18 +248,20 @@ bool SimulationSceneManager::references_model(const std::string& model_id,
   std::lock_guard lock{mutex_};
   for (const auto& [scene_id, scene] : scenes_) {
     (void)scene_id;
-    for (const auto& model : scene.value("models", nlohmann::json::array())) {
-      if (model.value("model_id", "") != model_id) continue;
+    bool found = false;
+    simulation::walk_model_references(scene, [&](const nlohmann::json& model) {
+      if (found || model.value("model_id", "") != model_id) return;
       const std::string referenced_version = model.value("version", "");
       if (!referenced_version.empty()) {
-        if (referenced_version == version) return true;
-        continue;
+        if (referenced_version == version) found = true;
+        return;
       }
       // Unpinned reference resolves to the latest version. Only block removal of
       // the version it currently resolves to; if the latest is unknown, stay
       // conservative and block any removal.
-      if (latest_version.empty() || latest_version == version) return true;
-    }
+      if (latest_version.empty() || latest_version == version) found = true;
+    });
+    if (found) return true;
   }
   return false;
 }

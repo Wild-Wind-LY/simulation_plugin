@@ -46,23 +46,20 @@ public:
 private:
   static std::filesystem::path default_output_dir();
   static std::filesystem::path default_export_dir();
-  static std::filesystem::path resolve_scene_path(const nlohmann::json& scene,
-                                                  const std::string& path_text);
   // Generate the full scene MJCF as a string. `model_file_ref` decides the
   // `file=` attribute for each `<model>` asset given the asset entry and its
   // resolved absolute source, letting callers emit absolute (compile) or
-  // relative-and-bundled (export) references.
+  // relative-and-bundled (export) references. Section-generation helpers
+  // (asset/worldbody/contact/equality/tendon/actuator/sensor/keyframe) and the
+  // small stateless utilities they share (xml_escape, numeric_list,
+  // resolve_scene_path, ...) live as free functions in simulation_compiler.cpp's
+  // anonymous namespace rather than class members, since none of them touch
+  // instance state and every new MJCF element type would otherwise need its own
+  // header declaration.
   std::string generate_scene_xml(
       const nlohmann::json& scene,
       const std::function<std::string(const nlohmann::json&, const std::filesystem::path&)>&
           model_file_ref) const;
-  static std::string xml_escape(const std::string& value);
-  static std::string numeric_list(const nlohmann::json& values, const std::string& fallback,
-                                  int expected_size);
-  static nlohmann::json numeric_array(const nlohmann::json& values,
-                                      std::initializer_list<double> fallback, int expected_size);
-  static std::string compile_primitive_object(const nlohmann::json& object);
-  static std::string compile_sensor_object(const nlohmann::json& sensor);
   static std::string structural_model_id(const nlohmann::json& scene);
   static ModelPtr load_model(const std::filesystem::path& path);
   std::filesystem::path write_compiled_mjcf(const nlohmann::json& scene,
