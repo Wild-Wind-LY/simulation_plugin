@@ -36,8 +36,18 @@ file(GLOB_RECURSE sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/source/
 add_library(${PROJECT_NAME} SHARED ${sources})
 target_compile_definitions(${PROJECT_NAME} PRIVATE PLUGIN_LOG_NAME=SimulationPlugin)
 
+# Bundled first-party MuJoCo plugins (elasticity/actuator/sensor/sdf). Each
+# registers itself via a __attribute__((constructor)) (mjPLUGIN_LIB_INIT in
+# mjplugin.h) as soon as its shared library is loaded, so linking them here is
+# sufficient for <extension><plugin plugin="mujoco...."/></extension> scenes
+# to resolve at mj_loadXML time -- no runtime mj_loadPluginLibrary needed.
+# --no-as-needed is required around them: we never call a symbol from these
+# libraries directly (the whole point is their load-time side effect), so the
+# linker's default --as-needed would otherwise drop the NEEDED entry entirely
+# and the constructor would never run.
 target_link_libraries(${PROJECT_NAME} PRIVATE
   nlohmann_json xplugin::sdk mujoco::mujoco Threads::Threads
+  "-Wl,--no-as-needed" elasticity actuator sensor sdf_plugin "-Wl,--as-needed"
 )
 
 set_target_properties(${PROJECT_NAME} PROPERTIES

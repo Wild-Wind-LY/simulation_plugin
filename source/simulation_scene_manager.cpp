@@ -67,9 +67,10 @@ nlohmann::json SimulationSceneManager::create(const nlohmann::json& data) {
                              ? data.at("scene")
                              : nlohmann::json::object();
   for (const char* key :
-       {"name", "physics", "environment", "models", "objects", "sensors", "contacts", "bodies",
-        "actuators", "equality", "tendon", "keyframes", "assets", "defaultClasses", "initial_state",
-        "defaults", "schema_version"}) {
+       {"name",     "physics",        "environment", "models",        "objects", "sensors",
+        "contacts", "bodies",         "actuators",   "equality",      "tendon",  "keyframes",
+        "assets",   "defaultClasses", "cameras",     "custom",        "flexes",  "skins",
+        "plugins",  "initial_state",  "defaults",    "schema_version"}) {
     if (data.contains(key)) scene[key] = data.at(key);
   }
   scene["id"] = id;
