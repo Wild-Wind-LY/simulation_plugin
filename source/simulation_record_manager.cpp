@@ -212,7 +212,9 @@ nlohmann::json SimulationRecordManager::stop_session(const std::shared_ptr<Sessi
     std::lock_guard lock{session->mutex};
     session->stop_requested = true;
   }
-  if (session->worker.joinable()) session->worker.join();
+  std::call_once(session->join_once, [&] {
+    if (session->worker.joinable()) session->worker.join();
+  });
 
   std::lock_guard lock{session->mutex};
   session->running = false;

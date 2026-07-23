@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 // Production-grade registry for reusable robot model assets (MJCF/URDF).
 //
@@ -78,6 +79,12 @@ private:
   std::filesystem::path manifest_path_;
   mutable std::mutex mutex_;
   std::unordered_map<std::string, nlohmann::json> entries_;
+  // id@version keys currently mid-registration (guarded by mutex_ like entries_).
+  // Without this, two concurrent register_model() calls for the same not-yet-
+  // registered id@version can both pass the "not already registered" check,
+  // both target the same package_dir(id,version), and the loser's cleanup-on-
+  // failure remove_all() deletes the files the winner just committed.
+  std::unordered_set<std::string> registering_;
   mutable std::mutex manifest_io_mutex_;
   mutable uint64_t manifest_generation_{0};
   mutable uint64_t last_written_generation_{0};

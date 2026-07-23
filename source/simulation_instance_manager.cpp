@@ -145,6 +145,9 @@ nlohmann::json SimulationInstanceManager::write_ctrl(const nlohmann::json& data)
 nlohmann::json SimulationInstanceManager::write_qpos(const nlohmann::json& data) {
   return find_or_throw(require_id(data))->write_qpos(data);
 }
+nlohmann::json SimulationInstanceManager::write_equality(const nlohmann::json& data) {
+  return find_or_throw(require_id(data))->write_equality(data);
+}
 nlohmann::json SimulationInstanceManager::list() const {
   nlohmann::json out = nlohmann::json::array();
   for (const auto& instance : snapshot_instances()) {

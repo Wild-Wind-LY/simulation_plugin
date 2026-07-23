@@ -53,6 +53,7 @@ public:
   nlohmann::json visual_model(bool include_geometry = true) const;
   nlohmann::json write_ctrl(const nlohmann::json& data);
   nlohmann::json write_qpos(const nlohmann::json& data);
+  nlohmann::json write_equality(const nlohmann::json& data);
 
 private:
   SimulationInstance(std::string id, std::string model_path, ModelPtr model, mjData* data);

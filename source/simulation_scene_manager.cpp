@@ -115,15 +115,21 @@ nlohmann::json SimulationSceneManager::save(const nlohmann::json& data) {
   to_write.erase("path");
 
   const auto tmp_path = scene_path.string() + ".tmp";
-  {
+  try {
     std::ofstream out(tmp_path, std::ios::trunc);
     if (!out) throw std::runtime_error("failed to open scene file for write: " + tmp_path);
     out << to_write.dump(2) << '\n';
     if (!out.good()) {
       out.close();
-      std::filesystem::remove(tmp_path, ec);
       throw std::runtime_error("failed to write scene file: " + tmp_path);
     }
+  } catch (...) {
+    // Catches both the explicit throws above and any exception from the write
+    // itself (e.g. dump()/stream failure) so tmp_path never survives on disk
+    // as an orphan regardless of which step failed.
+    std::error_code cleanup_ec;
+    std::filesystem::remove(tmp_path, cleanup_ec);
+    throw;
   }
   std::filesystem::rename(tmp_path, scene_path, ec);
   if (ec) {

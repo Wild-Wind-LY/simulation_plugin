@@ -35,6 +35,12 @@ private:
     bool running{false};
     mutable std::mutex mutex;
     std::thread worker;
+    // Guards the actual `worker.join()` call in stop_session(): stop()/remove()/
+    // stop_all() can all reach the same session concurrently (e.g. a client
+    // races record.stop against record.remove), and joining the same std::thread
+    // from two threads at once is undefined behavior. call_once ensures only one
+    // caller actually joins; the rest block until that join has completed.
+    std::once_flag join_once;
   };
 
   static std::filesystem::path default_output_dir();

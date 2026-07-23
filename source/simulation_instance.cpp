@@ -310,6 +310,33 @@ nlohmann::json SimulationInstance::write_qpos(const nlohmann::json& data) {
   return state_locked();
 }
 
+nlohmann::json SimulationInstance::write_equality(const nlohmann::json& data) {
+  std::lock_guard lock{mutex_};
+  if (!model_ || !data_) {
+    status_ = Status::Error;
+    return state_locked();
+  }
+  if (model_->neq <= 0) throw std::invalid_argument("model has no equality constraints");
+
+  if (!data.contains("values") || !data["values"].is_object()) {
+    throw std::invalid_argument("missing 'values' object (equality name/id -> bool)");
+  }
+
+  // Toggling data_->eq_active is MuJoCo's own runtime hook for enabling/disabling
+  // an equality constraint without recompiling the model -- this is what lets a
+  // scene pre-load several candidate tools (each welded to the arm's end effector
+  // via its own equality constraint) and switch which one is "attached" mid-run.
+  for (auto it = data["values"].begin(); it != data["values"].end(); ++it) {
+    const int index = resolve_index(model_, mjOBJ_EQUALITY, it.key(), model_->neq);
+    if (index < 0) throw std::invalid_argument("equality constraint not found: " + it.key());
+    if (!it.value().is_boolean())
+      throw std::invalid_argument("equality value must be boolean: " + it.key());
+    data_->eq_active[index] = it.value().get<bool>() ? 1 : 0;
+  }
+
+  return state_locked();
+}
+
 const char* SimulationInstance::status_text(Status status) noexcept {
   switch (status) {
     case Status::Created:
@@ -461,16 +488,24 @@ nlohmann::json SimulationInstance::state_locked(bool include_arrays) const {
 
   out["time"] = static_cast<double>(data_->time);
   out["model"] = {
-      {"nq", model_->nq},
-      {"nv", model_->nv},
-      {"nu", model_->nu},
-      {"nsensordata", model_->nsensordata},
+      {"nq", model_->nq},   {"nv", model_->nv},
+      {"nu", model_->nu},   {"nsensordata", model_->nsensordata},
+      {"neq", model_->neq},
   };
   if (include_arrays) {
     out["qpos"] = numeric_array(data_->qpos, model_->nq);
     out["qvel"] = numeric_array(data_->qvel, model_->nv);
     out["ctrl"] = numeric_array(data_->ctrl, model_->nu);
     out["sensordata"] = numeric_array(data_->sensordata, model_->nsensordata);
+    if (model_->neq > 0) {
+      // name -> bool (rather than a bare index array) so callers don't need to
+      // separately fetch metadata() just to know which index is which constraint.
+      nlohmann::json equality_active = nlohmann::json::object();
+      for (int i = 0; i < model_->neq; ++i) {
+        equality_active[object_name(model_, mjOBJ_EQUALITY, i)] = data_->eq_active[i] != 0;
+      }
+      out["equality_active"] = std::move(equality_active);
+    }
   }
   return out;
 }
@@ -491,6 +526,7 @@ nlohmann::json SimulationInstance::metadata_locked() const {
       {"nbody", model_->nbody},
       {"nsensor", model_->nsensor},
       {"nsensordata", model_->nsensordata},
+      {"neq", model_->neq},
   };
 
   out["joints"] = nlohmann::json::array();
@@ -542,6 +578,19 @@ nlohmann::json SimulationInstance::metadata_locked() const {
         {"type", model_->sensor_type[i]},
         {"data_adr", model_->sensor_adr[i]},
         {"data_dim", model_->sensor_dim[i]},
+    });
+  }
+
+  // Lets a client discover which equality constraints exist and their current
+  // on/off state without guessing names -- see write_equality() for the runtime
+  // toggle this is meant to be read alongside (e.g. tool-change via weld).
+  out["equalities"] = nlohmann::json::array();
+  for (int i = 0; i < model_->neq; ++i) {
+    const bool active = data_ ? data_->eq_active[i] != 0 : model_->eq_active0[i] != 0;
+    out["equalities"].push_back({
+        {"id", i},
+        {"name", object_name(model_, mjOBJ_EQUALITY, i)},
+        {"active", active},
     });
   }
 

@@ -146,6 +146,8 @@ JsonRpcRouter::RouteMap SimulationPlug::build_routes() {
        [this](const nlohmann::json& data) { return handle_control_write_ctrl(data); }},
       {"control.write_qpos",
        [this](const nlohmann::json& data) { return handle_control_write_qpos(data); }},
+      {"control.write_equality",
+       [this](const nlohmann::json& data) { return handle_control_write_equality(data); }},
 
   };
 }
@@ -222,10 +224,10 @@ JsonRpcResult SimulationPlug::handle_scene_apply(const nlohmann::json& data) {
     };
 
     if (diff.value("requires_recreate", false)) {
-      auto compiled = compiler_.compile_scene(resolve_scene_models(updated_scene));
+      SimulationCompiler::ModelPtr model;
+      auto compiled = compiler_.compile_scene(resolve_scene_models(updated_scene), &model);
       auto config = compiler_.build_instance_config({{"id", instance_id}, {"scene_id", scene_id}},
                                                     compiled);
-      auto model = compiler_.get_compiled_model(compiled.value("compiled_model_id", ""));
       auto recreated = instances_.recreate(config, std::move(model));
       publish_state(recreated["state"]);
       result["applied"] = true;
@@ -289,13 +291,13 @@ JsonRpcResult SimulationPlug::handle_scene_diff(const nlohmann::json& data) {
 JsonRpcResult SimulationPlug::handle_scene_compile(const nlohmann::json& data) {
   return dispatch("scene.compile", "scene compiled", [&] {
     const auto scene = scenes_.info(data);
-    auto result = compiler_.compile_scene(resolve_scene_models(scene));
+    SimulationCompiler::ModelPtr compiled_model;
+    auto result = compiler_.compile_scene(resolve_scene_models(scene), &compiled_model);
     // include_visual: 无需创建实例即可拿到编译几何，编辑器用它渲染真实模型。
     // 临时 mjData 只做一次 mj_forward 取世界位姿，用完即弃。
     if (data.value("include_visual", false)) {
       const bool include_geometry = data.value("include_geometry", true);
-      if (auto model
-          = compiler_.get_compiled_model(result.value("compiled_model_id", std::string{}))) {
+      if (auto& model = compiled_model) {
         if (mjData* tmp = mj_makeData(model.get())) {
           // 预览应用场景
           // initial_state.qpos，让初始关节角与实例创建后一致（宽容截断，静默跳过非法值）
@@ -352,9 +354,8 @@ JsonRpcResult SimulationPlug::handle_instance_create(const nlohmann::json& data)
     const std::string scene_id = data.value("scene_id", "");
     if (!scene_id.empty()) {
       auto scene = scenes_.info({{"id", scene_id}});
-      auto compiled = compiler_.compile_scene(resolve_scene_models(scene));
+      auto compiled = compiler_.compile_scene(resolve_scene_models(scene), &shared_model);
       config = compiler_.build_instance_config(data, compiled);
-      shared_model = compiler_.get_compiled_model(compiled.value("compiled_model_id", ""));
     } else {
       auto [compiled_model_id, model] = compiler_.get_or_load_model(data.value("model_path", ""));
       config["compiled_model_id"] = compiled_model_id;
@@ -371,9 +372,9 @@ JsonRpcResult SimulationPlug::handle_instance_recreate_from_scene(const nlohmann
     const std::string scene_id = data.value("scene_id", "");
     if (scene_id.empty()) throw std::invalid_argument("missing 'scene_id'");
     auto scene = scenes_.info({{"id", scene_id}});
-    auto compiled = compiler_.compile_scene(resolve_scene_models(scene));
+    SimulationCompiler::ModelPtr model;
+    auto compiled = compiler_.compile_scene(resolve_scene_models(scene), &model);
     auto config = compiler_.build_instance_config(data, compiled);
-    auto model = compiler_.get_compiled_model(compiled.value("compiled_model_id", ""));
     auto result = instances_.recreate(config, std::move(model));
     publish_state(result["state"]);
     if (data.value("start", false)) {
@@ -566,6 +567,14 @@ JsonRpcResult SimulationPlug::handle_control_write_ctrl(const nlohmann::json& da
 JsonRpcResult SimulationPlug::handle_control_write_qpos(const nlohmann::json& data) {
   return dispatch("control.write_qpos", "qpos written", [&] {
     auto state = instances_.write_qpos(data);
+    publish_state(state);
+    return state;
+  });
+}
+
+JsonRpcResult SimulationPlug::handle_control_write_equality(const nlohmann::json& data) {
+  return dispatch("control.write_equality", "equality toggled", [&] {
+    auto state = instances_.write_equality(data);
     publish_state(state);
     return state;
   });

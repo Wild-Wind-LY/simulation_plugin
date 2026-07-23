@@ -126,9 +126,19 @@ namespace {
       const bool a_num = !pa.empty() && std::all_of(pa.begin(), pa.end(), ::isdigit);
       const bool b_num = !pb.empty() && std::all_of(pb.begin(), pb.end(), ::isdigit);
       if (a_num && b_num) {
-        const unsigned long long na = std::stoull(pa);
-        const unsigned long long nb = std::stoull(pb);
-        if (na != nb) return na < nb ? -1 : 1;
+        // safe_identifier only restricts the character set, not the length, so
+        // an all-digit segment can still be long enough to overflow unsigned
+        // long long and make stoull throw std::out_of_range -- that would
+        // otherwise propagate out of this comparator (used from list()'s
+        // std::sort), so fall back to a lexical compare for that segment
+        // instead of letting it escape as an unrelated-looking exception.
+        try {
+          const unsigned long long na = std::stoull(pa);
+          const unsigned long long nb = std::stoull(pb);
+          if (na != nb) return na < nb ? -1 : 1;
+        } catch (const std::exception&) {
+          if (pa != pb) return pa < pb ? -1 : 1;
+        }
       } else if (pa != pb) {
         return pa < pb ? -1 : 1;
       }
@@ -164,7 +174,12 @@ namespace {
     std::vector<std::filesystem::path> candidates;
     std::error_code ec;
     for (const auto& dir_entry : std::filesystem::directory_iterator(dir, ec)) {
-      if (!dir_entry.is_regular_file()) continue;
+      // is_regular_file() follows symlinks, but snapshot_package()/copy_directory_tree
+      // explicitly skips symlinked entries when packaging -- picking a symlink here
+      // would select a "source" that never actually gets copied into the package,
+      // so effective_path ends up missing and mj_loadXML fails with an unrelated-
+      // looking "failed to compile model" instead of a clear "no usable model file".
+      if (dir_entry.is_symlink() || !dir_entry.is_regular_file()) continue;
       auto ext = dir_entry.path().extension().string();
       std::transform(ext.begin(), ext.end(), ext.begin(),
                      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -257,7 +272,20 @@ nlohmann::json SimulationModelRegistry::register_model(const nlohmann::json& dat
     std::lock_guard lock{mutex_};
     if (entries_.find(entry_key) != entries_.end() && !replace)
       throw std::invalid_argument("model version already registered: " + entry_key);
+    if (!registering_.insert(entry_key).second)
+      throw std::invalid_argument("model version registration already in progress: " + entry_key);
   }
+  // RAII release of the `registering_` reservation above -- fires on every exit
+  // path (success or any of the throws below) so a failed/aborted registration
+  // never permanently blocks retrying the same id@version.
+  struct RegistrationGuard {
+    SimulationModelRegistry* self;
+    std::string key;
+    ~RegistrationGuard() {
+      std::lock_guard lock{self->mutex_};
+      self->registering_.erase(key);
+    }
+  } registration_guard{this, entry_key};
 
   std::filesystem::create_directories(storage_dir_);
 
@@ -409,34 +437,37 @@ nlohmann::json SimulationModelRegistry::remove(const nlohmann::json& data) {
   if (id.empty() || version.empty())
     throw std::invalid_argument("model remove requires id and version");
 
+  nlohmann::json entry;
+  bool other_versions = false;
   nlohmann::json manifest_snapshot;
   uint64_t generation = 0;
   {
     std::lock_guard lock{mutex_};
     auto it = entries_.find(key(id, version));
     if (it == entries_.end()) throw std::out_of_range("model version not found");
-    const auto entry = it->second;
+    entry = it->second;
     entries_.erase(it);
-
-    std::error_code ec;
-    if (entry.value("packaged", false)) {
-      const auto pkg = package_dir(id, version);
-      if (is_within(pkg, storage_dir_)) std::filesystem::remove_all(pkg, ec);
-
-      // Last version of this id gone: the now-empty "<storage_dir_>/<id>/" parent
-      // is otherwise orphaned on disk forever, since nothing else ever cleans it up.
-      const bool other_versions
-          = std::any_of(entries_.begin(), entries_.end(),
-                        [&](const auto& kv) { return kv.second.value("id", "") == id; });
-      if (!other_versions) {
-        const auto model_dir = pkg.parent_path();
-        if (is_within(model_dir, storage_dir_)) std::filesystem::remove_all(model_dir, ec);
-      }
-    } else if (entry.value("format", "") == "urdf") {
-      std::filesystem::remove(entry.value("effective_path", ""), ec);
-    }
+    // Last version of this id gone: the now-empty "<storage_dir_>/<id>/" parent
+    // is otherwise orphaned on disk forever, since nothing else ever cleans it up.
+    other_versions = std::any_of(entries_.begin(), entries_.end(),
+                                 [&](const auto& kv) { return kv.second.value("id", "") == id; });
     manifest_snapshot = snapshot_manifest_locked();
     generation = ++manifest_generation_;
+  }
+  // Filesystem cleanup happens without mutex_ held -- mirrors persist_manifest's
+  // own "don't hold the lock across slow IO" rule just below; deleting a large
+  // packaged model's meshes/textures would otherwise block every concurrent
+  // list()/info()/verify()/resolve_scene() call for the duration.
+  std::error_code ec;
+  if (entry.value("packaged", false)) {
+    const auto pkg = package_dir(id, version);
+    if (is_within(pkg, storage_dir_)) std::filesystem::remove_all(pkg, ec);
+    if (!other_versions) {
+      const auto model_dir = pkg.parent_path();
+      if (is_within(model_dir, storage_dir_)) std::filesystem::remove_all(model_dir, ec);
+    }
+  } else if (entry.value("format", "") == "urdf") {
+    std::filesystem::remove(entry.value("effective_path", ""), ec);
   }
   persist_manifest(std::move(manifest_snapshot), generation);
   return {{"id", id}, {"version", version}, {"removed", true}};

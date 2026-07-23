@@ -23,7 +23,18 @@ public:
   nlohmann::json validate_scene(const nlohmann::json& scene) const;
   nlohmann::json diff_scenes(const nlohmann::json& old_scene,
                              const nlohmann::json& new_scene) const;
-  nlohmann::json compile_scene(const nlohmann::json& scene) const;
+  // `out_model`, when non-null, receives the same ModelPtr this call just
+  // inserted into (or found in) the cache -- kept alive by the caller's own
+  // copy from this point on, so a caller that needs the mjModel right after
+  // compiling never has to re-look-it-up via a separate get_compiled_model()
+  // call. That separate-lookup pattern used to be the only way to get the
+  // model, which left a window between this call returning and the follow-up
+  // lookup where the cache's own copy could be the *only* live reference
+  // (use_count()==1) and therefore eligible for LRU eviction by an unrelated
+  // concurrent compile_scene() -- so a scene that had just compiled
+  // successfully could fail immediately after with "compiled model not
+  // found". Passing out_model closes that window entirely.
+  nlohmann::json compile_scene(const nlohmann::json& scene, ModelPtr* out_model = nullptr) const;
   // Emit a self-contained MJCF bundle at `<out_dir>/scene.xml` that opens
   // directly in MuJoCo `simulate` on any machine. `out_dir` empty -> default
   // export directory keyed by scene id.

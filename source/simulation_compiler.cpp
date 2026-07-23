@@ -438,8 +438,14 @@ namespace {
   // runtime-irrelevant to compilation-cache validity in the sense that class
   // definitions are structural on their own merits, not via this key.
   nlohmann::json structural_signature(const nlohmann::json& scene) {
+    // `schema_version` is stamped by SimulationSceneManager's normalize_schema
+    // and never read by any compile_*/generate_* function below, so it has zero
+    // effect on compiled output; without this it counts as structural by the
+    // "list what doesn't matter" inversion, and an apply patch that happens to
+    // carry an explicit schema_version would force an unnecessary instance
+    // recreate for a field that can't possibly have changed the compiled model.
     static const std::set<std::string> kRuntimeOnlyKeys
-        = {"initial_state", "defaults", "path", "name"};
+        = {"initial_state", "defaults", "path", "name", "schema_version"};
     nlohmann::json signature = nlohmann::json::object();
     if (!scene.is_object()) return signature;
     for (const auto& [key, value] : scene.items()) {
@@ -798,13 +804,27 @@ namespace {
     return xml.str();
   }
 
+  // MJCF <site> only accepts this fixed shape set (confirmed against
+  // xml_native_reader.cc's site attribute table); shared by compile_site,
+  // default_site_attrs (defaultClasses[].site.type) and validate_scene so a
+  // bogus/typo'd type is caught with a clear error instead of either being
+  // silently written unescaped into an XML attribute or failing much later
+  // inside mj_loadXML with an opaque message.
+  const std::set<std::string>& site_shape_types() {
+    static const std::set<std::string> kTypes
+        = {"sphere", "box", "capsule", "cylinder", "ellipsoid"};
+    return kTypes;
+  }
+
   std::string compile_site(const nlohmann::json& site) {
     const std::string id = site.value("id", "");
     if (id.empty()) throw std::invalid_argument("site missing 'id'");
     const std::string type = site.value("type", "sphere");
+    if (!site_shape_types().count(type))
+      throw std::invalid_argument("unsupported site type: " + type);
 
     std::ostringstream xml;
-    xml << "      <site name=\"" << xml_escape(id) << "\" type=\"" << type << "\"";
+    xml << "      <site name=\"" << xml_escape(id) << "\" type=\"" << xml_escape(type) << "\"";
     if (site.contains("pos")) xml << " pos=\"" << numeric_list(site["pos"], "0 0 0", 3) << "\"";
     if (site.contains("quat"))
       xml << " quat=\"" << numeric_list(site["quat"], "1 0 0 0", 4) << "\"";
@@ -910,9 +930,28 @@ namespace {
   // tendon defaults exist in MJCF but aren't exposed here; joint/geom/site/
   // camera/actuator cover the attributes this schema's instances actually use.
 
+  // Shared with validate_scene's defaultClasses[] check so a bad/typo'd type in
+  // a class default is rejected up front instead of either landing unescaped in
+  // an XML attribute or failing later inside mj_loadXML with an opaque message
+  // (same reasoning as site_shape_types() above).
+  const std::set<std::string>& joint_type_names() {
+    static const std::set<std::string> kTypes = {"hinge", "slide", "ball", "free"};
+    return kTypes;
+  }
+  const std::set<std::string>& geom_type_names() {
+    static const std::set<std::string> kTypes
+        = {"box", "sphere", "cylinder", "capsule", "ellipsoid", "plane", "mesh", "hfield", "sdf"};
+    return kTypes;
+  }
+
   std::string default_joint_attrs(const nlohmann::json& joint) {
     std::ostringstream xml;
-    if (joint.contains("type")) xml << " type=\"" << joint["type"].get<std::string>() << "\"";
+    if (joint.contains("type")) {
+      const auto type = joint["type"].get<std::string>();
+      if (!joint_type_names().count(type))
+        throw std::invalid_argument("unsupported joint type: " + type);
+      xml << " type=\"" << xml_escape(type) << "\"";
+    }
     if (joint.contains("axis")) xml << " axis=\"" << numeric_list(joint["axis"], "", 3) << "\"";
     if (joint.contains("range"))
       xml << " range=\"" << numeric_list(joint["range"], "", 2) << "\" limited=\"true\"";
@@ -924,7 +963,12 @@ namespace {
 
   std::string default_geom_attrs(const nlohmann::json& geom) {
     std::ostringstream xml;
-    if (geom.contains("type")) xml << " type=\"" << geom["type"].get<std::string>() << "\"";
+    if (geom.contains("type")) {
+      const auto type = geom["type"].get<std::string>();
+      if (!geom_type_names().count(type))
+        throw std::invalid_argument("unsupported geom type: " + type);
+      xml << " type=\"" << xml_escape(type) << "\"";
+    }
     if (geom.contains("size")) xml << " size=\"" << numeric_list(geom["size"], "", 0) << "\"";
     if (geom.contains("rgba")) xml << " rgba=\"" << numeric_list(geom["rgba"], "", 4) << "\"";
     if (!geom.value("material", "").empty())
@@ -941,7 +985,12 @@ namespace {
 
   std::string default_site_attrs(const nlohmann::json& site) {
     std::ostringstream xml;
-    if (site.contains("type")) xml << " type=\"" << site["type"].get<std::string>() << "\"";
+    if (site.contains("type")) {
+      const auto type = site["type"].get<std::string>();
+      if (!site_shape_types().count(type))
+        throw std::invalid_argument("unsupported site type: " + type);
+      xml << " type=\"" << xml_escape(type) << "\"";
+    }
     if (site.contains("size")) xml << " size=\"" << numeric_list(site["size"], "", 0) << "\"";
     return xml.str();
   }
@@ -1129,6 +1178,15 @@ namespace {
     if (id.empty()) throw std::invalid_argument("equality constraint missing 'id'");
     const std::string type = eq.value("type", "");
 
+    // MJCF's connect/weld/joint/tendon equality elements all accept an `active`
+    // attribute (initial enable/disable state, mirrored at runtime by
+    // mjData::eq_active -- see xml_native_reader.cc's equality schema table).
+    // Only emitted when explicitly set so an omitted value keeps MuJoCo's own
+    // default (active=true).
+    std::string active_attr;
+    if (eq.contains("active") && eq["active"].is_boolean())
+      active_attr = eq["active"].get<bool>() ? " active=\"true\"" : " active=\"false\"";
+
     std::ostringstream xml;
     if (type == "connect") {
       const std::string body1 = eq.value("body1", "");
@@ -1137,21 +1195,22 @@ namespace {
         throw std::invalid_argument("equality.connect requires body1 and body2");
       xml << "    <connect name=\"" << xml_escape(id) << "\" body1=\"" << xml_escape(body1)
           << "\" body2=\"" << xml_escape(body2) << "\" anchor=\""
-          << numeric_list(eq.value("anchor", nlohmann::json::array()), "0 0 0", 3) << "\"/>\n";
+          << numeric_list(eq.value("anchor", nlohmann::json::array()), "0 0 0", 3) << "\""
+          << active_attr << "/>\n";
     } else if (type == "weld") {
       const std::string body1 = eq.value("body1", "");
       const std::string body2 = eq.value("body2", "");
       if (body1.empty() || body2.empty())
         throw std::invalid_argument("equality.weld requires body1 and body2");
       xml << "    <weld name=\"" << xml_escape(id) << "\" body1=\"" << xml_escape(body1)
-          << "\" body2=\"" << xml_escape(body2) << "\"/>\n";
+          << "\" body2=\"" << xml_escape(body2) << "\"" << active_attr << "/>\n";
     } else if (type == "joint") {
       const std::string joint1 = eq.value("joint1", "");
       const std::string joint2 = eq.value("joint2", "");
       if (joint1.empty()) throw std::invalid_argument("equality.joint requires joint1");
       xml << "    <joint name=\"" << xml_escape(id) << "\" joint1=\"" << xml_escape(joint1) << "\"";
       if (!joint2.empty()) xml << " joint2=\"" << xml_escape(joint2) << "\"";
-      xml << "/>\n";
+      xml << active_attr << "/>\n";
     } else if (type == "tendon") {
       const std::string tendon1 = eq.value("tendon1", "");
       const std::string tendon2 = eq.value("tendon2", "");
@@ -1161,7 +1220,7 @@ namespace {
       if (!tendon2.empty()) xml << " tendon2=\"" << xml_escape(tendon2) << "\"";
       if (eq.contains("polycoef"))
         xml << " polycoef=\"" << numeric_list(eq["polycoef"], "", 5) << "\"";
-      xml << "/>\n";
+      xml << active_attr << "/>\n";
     } else {
       throw std::invalid_argument("unsupported equality type: " + type);
     }
@@ -2277,6 +2336,26 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
           continue;
         }
         class_parent[id] = cls.value("parent", "");
+        // compile_default_node's default_joint_attrs/default_geom_attrs/
+        // default_site_attrs throw on an unsupported `type`, but that only
+        // surfaces at compile time -- check it here too so scene.validate can
+        // catch it up front (mirrors the same check already done for
+        // bodies[].joints/geoms/sites below).
+        if (cls.contains("joint") && cls["joint"].is_object() && cls["joint"].contains("type")) {
+          const auto jtype = cls["joint"].value("type", "");
+          if (!joint_type_names().count(jtype))
+            add_issue(errors, path + ".joint.type", "unsupported joint type: " + jtype);
+        }
+        if (cls.contains("geom") && cls["geom"].is_object() && cls["geom"].contains("type")) {
+          const auto gtype = cls["geom"].value("type", "");
+          if (!geom_type_names().count(gtype))
+            add_issue(errors, path + ".geom.type", "unsupported geom type: " + gtype);
+        }
+        if (cls.contains("site") && cls["site"].is_object() && cls["site"].contains("type")) {
+          const auto stype = cls["site"].value("type", "");
+          if (!site_shape_types().count(stype))
+            add_issue(errors, path + ".site.type", "unsupported site type: " + stype);
+        }
       }
       for (const auto& [id, parent] : class_parent) {
         if (parent.empty()) continue;
@@ -2368,6 +2447,15 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
           const std::string jtype = joint.value("type", "hinge");
           if (jtype != "hinge" && jtype != "slide" && jtype != "ball" && jtype != "free")
             add_issue(errors, jpath + ".type", "unsupported joint type: " + jtype);
+          // compile_joint enforces these lengths via numeric_list's expected_size
+          // (axis/range only apply to hinge/slide, matching compile_joint's own
+          // condition) -- without checking them here, a bad length passes
+          // validate_scene and only fails much later inside compile_scene.
+          if ((jtype == "hinge" || jtype == "slide") && joint.contains("axis"))
+            check_vec(joint, "axis", jpath, 3);
+          if ((jtype == "hinge" || jtype == "slide") && joint.contains("range"))
+            check_vec(joint, "range", jpath, 2);
+          if (joint.contains("pos")) check_vec(joint, "pos", jpath, 3);
           check_class_ref(joint, jpath, "class");
         }
         const auto geoms = body.value("geoms", nlohmann::json::array());
@@ -2380,10 +2468,7 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
           else if (!ids.insert(gid).second)
             add_issue(errors, gpath + ".id", "duplicate scene id: " + gid);
           const std::string gtype = geom.value("type", "box");
-          static const std::set<std::string> kGeomTypes
-              = {"box",   "sphere", "cylinder", "capsule", "ellipsoid",
-                 "plane", "mesh",   "hfield",   "sdf"};
-          if (!kGeomTypes.count(gtype)) {
+          if (!geom_type_names().count(gtype)) {
             add_issue(errors, gpath + ".type", "unsupported geom type: " + gtype);
           } else if (gtype == "mesh") {
             const std::string mesh_ref = geom.value("mesh", "");
@@ -2414,6 +2499,24 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
               add_issue(errors, gpath + ".material",
                         "geom.material must reference a declared material asset");
           }
+          // Matches compile_geom's own has_type-gated size-count enforcement
+          // exactly: a size given without an explicit type is left to the class
+          // chain to resolve there too, so no fixed length is enforced here
+          // either (that geom would fail structural_signature/compile if the
+          // class chain genuinely doesn't cover it, which is expected).
+          if (geom.contains("size") && geom.contains("type")) {
+            size_t expected = 0;
+            if (gtype == "box" || gtype == "ellipsoid" || gtype == "plane")
+              expected = 3;
+            else if (gtype == "sphere")
+              expected = 1;
+            else if (gtype == "cylinder" || gtype == "capsule")
+              expected = 2;
+            if (expected > 0) check_vec(geom, "size", gpath, expected);
+          }
+          if (geom.contains("pos")) check_vec(geom, "pos", gpath, 3);
+          if (geom.contains("quat")) check_vec(geom, "quat", gpath, 4);
+          if (geom.contains("rgba")) check_vec(geom, "rgba", gpath, 4);
           check_class_ref(geom, gpath, "class");
         }
         const auto sites = body.value("sites", nlohmann::json::array());
@@ -2424,6 +2527,13 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
             add_issue(errors, spath + ".id", "site missing id");
           else if (!ids.insert(sid).second)
             add_issue(errors, spath + ".id", "duplicate scene id: " + sid);
+          if (sites[j].contains("type")) {
+            const auto stype = sites[j].value("type", "");
+            if (!site_shape_types().count(stype))
+              add_issue(errors, spath + ".type", "unsupported site type: " + stype);
+          }
+          if (sites[j].contains("pos")) check_vec(sites[j], "pos", spath, 3);
+          if (sites[j].contains("quat")) check_vec(sites[j], "quat", spath, 4);
           check_class_ref(sites[j], spath, "class");
         }
         const auto cameras = body.value("cameras", nlohmann::json::array());
@@ -2434,6 +2544,8 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
             add_issue(errors, cpath + ".id", "camera missing id");
           else if (!ids.insert(cid).second)
             add_issue(errors, cpath + ".id", "duplicate scene id: " + cid);
+          if (cameras[j].contains("pos")) check_vec(cameras[j], "pos", cpath, 3);
+          if (cameras[j].contains("quat")) check_vec(cameras[j], "quat", cpath, 4);
           check_class_ref(cameras[j], cpath, "class");
         }
       }
@@ -2566,6 +2678,8 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
           else
             check_plugin_ref(actuator, path, "plugin_instance");
         }
+        if (actuator.contains("ctrlrange")) check_vec(actuator, "ctrlrange", path, 2);
+        if (actuator.contains("forcerange")) check_vec(actuator, "forcerange", path, 2);
         check_class_ref(actuator, path, "class");
       }
     }
@@ -2592,15 +2706,19 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
         if (type == "connect" || type == "weld") {
           if (eq.value("body1", "").empty() || eq.value("body2", "").empty())
             add_issue(errors, path, "equality." + type + " requires body1 and body2");
+          if (type == "connect" && eq.contains("anchor")) check_vec(eq, "anchor", path, 3);
         } else if (type == "joint") {
           if (eq.value("joint1", "").empty())
             add_issue(errors, path + ".joint1", "equality.joint requires joint1");
         } else if (type == "tendon") {
           if (eq.value("tendon1", "").empty())
             add_issue(errors, path + ".tendon1", "equality.tendon requires tendon1");
+          if (eq.contains("polycoef")) check_vec(eq, "polycoef", path, 5);
         } else {
           add_issue(errors, path + ".type", "unsupported equality type: " + type);
         }
+        if (eq.contains("active") && !eq["active"].is_boolean())
+          add_issue(errors, path + ".active", "active must be a boolean");
       }
     }
   }
@@ -2624,8 +2742,19 @@ nlohmann::json SimulationCompiler::validate_scene(const nlohmann::json& scene) c
           add_issue(errors, path + ".id", "duplicate scene id: " + id);
         const std::string type = tendon.value("type", "");
         if (type == "fixed") {
-          if (tendon.value("joints", nlohmann::json::array()).empty())
+          const auto tjoints = tendon.value("joints", nlohmann::json::array());
+          if (tjoints.empty()) {
             add_issue(errors, path + ".joints", "tendon.fixed requires at least one joint");
+          } else {
+            // compile_tendon writes an empty joint="" attribute verbatim if this
+            // is missing, which mj_loadXML only rejects much later with an
+            // opaque message -- catch it here instead.
+            for (size_t j = 0; j < tjoints.size(); ++j) {
+              if (tjoints[j].value("joint", "").empty())
+                add_issue(errors, path + ".joints[" + std::to_string(j) + "].joint",
+                          "tendon.fixed joint entry requires 'joint'");
+            }
+          }
         } else if (type == "spatial") {
           const auto pathElements = tendon.value("path", nlohmann::json::array());
           if (pathElements.is_array() && !pathElements.empty()) {
@@ -2832,7 +2961,8 @@ nlohmann::json SimulationCompiler::diff_scenes(const nlohmann::json& old_scene,
   };
 }
 
-nlohmann::json SimulationCompiler::compile_scene(const nlohmann::json& scene) const {
+nlohmann::json SimulationCompiler::compile_scene(const nlohmann::json& scene,
+                                                 ModelPtr* out_model) const {
   const auto validation = validate_scene(scene);
   if (!validation.value("valid", false)) {
     throw std::invalid_argument("scene validation failed: " + validation["errors"].dump());
@@ -2953,6 +3083,7 @@ nlohmann::json SimulationCompiler::compile_scene(const nlohmann::json& scene) co
     }
   }
 
+  if (out_model) *out_model = model;
   return compiled;
 }
 
@@ -3165,6 +3296,15 @@ std::string SimulationCompiler::structural_model_id(const nlohmann::json& scene)
   };
   for (const auto& model : scene.value("models", nlohmann::json::array()))
     append_timestamp(resolve_scene_path(scene, model.value("source", "")));
+  // assets[] (mesh/texture/hfield) embed the same resolve_scene_path-resolved
+  // absolute path into the compiled <mesh file=".."/>/<texture file=".."/>/
+  // <hfield file=".."/> attributes -- without this, overwriting a referenced
+  // asset file's *content* (same path, so the scene JSON itself is unchanged)
+  // would silently keep serving the stale cached model.
+  for (const auto& asset : scene.value("assets", nlohmann::json::array())) {
+    const std::string file = asset.value("file", "");
+    if (!file.empty()) append_timestamp(resolve_scene_path(scene, file));
+  }
 
   return scene.value("id", "scene") + '-' + simulation::sha256_string(input.str()).substr(0, 32);
 }
