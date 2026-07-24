@@ -13,7 +13,20 @@ namespace {
   }
 
   bool is_ignored_dir_name(const std::string& name) {
-    return name == ".git" || name == ".svn" || name == ".hg";
+    return name == ".git" || name == ".svn" || name == ".hg" || name == "__pycache__"
+           || name == ".idea" || name == ".vscode";
+  }
+
+  // OS/editor cruft that can end up inside a dragged-in asset folder but is
+  // never part of the actual model (Finder/Explorer metadata, editor swap and
+  // backup files). Filtered out so a registered package stays an exact,
+  // uncluttered snapshot of the model's own files -- not a cache or a
+  // transform, just excluding noise that was never part of the asset.
+  bool is_ignored_file_name(const std::string& name) {
+    if (name == ".DS_Store" || name == "Thumbs.db" || name == "desktop.ini") return true;
+    if (!name.empty() && name.back() == '~') return true;
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".swp") == 0) return true;
+    return false;
   }
 
 }  // namespace
@@ -68,6 +81,8 @@ namespace simulation {
           continue;
         }
         if (entry.is_symlink()) continue;
+        if (entry.is_regular_file() && is_ignored_file_name(entry.path().filename().string()))
+          continue;
         if (entry.is_regular_file()) {
           std::error_code ec;
           total_bytes += static_cast<uint64_t>(entry.file_size(ec));
@@ -93,6 +108,8 @@ namespace simulation {
         continue;
       }
       if (entry.is_symlink()) continue;
+      if (entry.is_regular_file() && is_ignored_file_name(entry.path().filename().string()))
+        continue;
       const auto rel = fs::relative(entry.path(), root);
       const auto dest = to / rel;
       std::error_code ec;

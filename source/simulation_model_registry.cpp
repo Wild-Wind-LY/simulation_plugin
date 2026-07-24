@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <fstream>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -202,6 +203,61 @@ namespace {
     return candidates.front();
   }
 
+  // Heuristics for "this registered file is actually a whole scene (several
+  // independent robots/tools composed together), not a single reusable asset".
+  // Neither signal is 100% reliable (a legitimate multi-fingered gripper can
+  // have several independently-jointed subtrees; some asset files do bundle a
+  // ground plane for standalone `simulate` preview), so this only ever
+  // produces warnings for register_model() to surface -- it never rejects on
+  // its own; a caller that wants strict rejection opts in via
+  // `require_single_asset` (see register_model()).
+  nlohmann::json scene_like_warnings(const mjModel* model) {
+    nlohmann::json warnings = nlohmann::json::array();
+
+    // Signal 1 (strongest): count distinct world-anchored root subtrees that
+    // have at least one joint somewhere inside them. MuJoCo guarantees
+    // body_parentid[i] < i for every body, so a single forward pass can fold
+    // each body up to the root it hangs off of directly under the world body
+    // (id 0). Two or more independently-jointed roots is the shape of "several
+    // robots/tools composed into one file", not a single reusable asset.
+    if (model->nbody > 1 && model->njnt > 0) {
+      std::vector<int> root_of(static_cast<size_t>(model->nbody), 0);
+      for (int i = 1; i < model->nbody; ++i) {
+        const int parent = model->body_parentid[i];
+        root_of[static_cast<size_t>(i)] = parent == 0 ? i : root_of[static_cast<size_t>(parent)];
+      }
+      std::set<int> roots_with_joints;
+      for (int j = 0; j < model->njnt; ++j) {
+        const int body = model->jnt_bodyid[j];
+        if (body > 0) roots_with_joints.insert(root_of[static_cast<size_t>(body)]);
+      }
+      if (roots_with_joints.size() >= 2) {
+        warnings.push_back("model has " + std::to_string(roots_with_joints.size())
+                           + " independently-jointed root subtrees under the world body -- this "
+                             "looks like a scene with multiple robots/tools composed together, "
+                             "not a single reusable asset");
+      }
+    }
+
+    // Signal 2 (supplementary): a plane geom attached directly to the world
+    // body (bodyid 0 -- the common case: a bare <geom type="plane"/> sitting
+    // straight inside <worldbody>, exactly how this project's own compiler
+    // emits its ground plane in generate_worldbody_xml) reads as "this file
+    // brought its own ground", which scenes do and standalone assets usually
+    // don't.
+    for (int i = 0; i < model->ngeom; ++i) {
+      if (model->geom_type[i] == mjGEOM_PLANE && model->geom_bodyid[i] == 0) {
+        warnings.push_back(
+            "model has a ground-like plane geom attached directly to the world "
+            "body -- scenes usually supply their own ground, a reusable asset "
+            "usually shouldn't");
+        break;
+      }
+    }
+
+    return warnings;
+  }
+
   // Inspect a compiled model and report robot-relevant metadata / warnings.
   nlohmann::json inspect_compiled_model(const mjModel* model, const std::string& format) {
     nlohmann::json warnings = nlohmann::json::array();
@@ -210,9 +266,12 @@ namespace {
     if (model->nsensor == 0) warnings.push_back("model has no sensors");
     if (format == "urdf" && model->nu == 0)
       warnings.push_back("URDF loaded, but no MuJoCo actuators were created");
+    const auto scene_warnings = scene_like_warnings(model);
+    for (const auto& w : scene_warnings) warnings.push_back(w);
 
     return {
         {"controllable", model->nu > 0},
+        {"scene_like", !scene_warnings.empty()},
         {"warnings", warnings},
         {"sizes",
          {{"nq", model->nq},
@@ -242,6 +301,10 @@ nlohmann::json SimulationModelRegistry::register_model(const nlohmann::json& dat
   const bool replace = data.value("replace", false);
   const bool copy_assets = data.value("copy_assets", true);
   const bool require_actuators = data.value("require_actuators", false);
+  // See scene_like_warnings(): opt-in strict rejection for "this looks like a
+  // whole scene, not a single reusable asset" -- default false (warn only via
+  // entry.warnings/scene_like) so this can't break existing registration flows.
+  const bool require_single_asset = data.value("require_single_asset", false);
   const uint64_t max_asset_bytes
       = data.value("max_asset_bytes", static_cast<uint64_t>(1) << 30);  // 1 GiB default
 
@@ -353,6 +416,13 @@ nlohmann::json SimulationModelRegistry::register_model(const nlohmann::json& dat
     std::filesystem::remove_all(pkg, ec);
     throw std::invalid_argument("model has no actuators but require_actuators was set");
   }
+  const bool scene_like = metadata.value("scene_like", false);
+  if (require_single_asset && scene_like) {
+    std::filesystem::remove_all(pkg, ec);
+    throw std::invalid_argument(
+        "model looks like a multi-robot scene, not a single reusable asset "
+        "(pass require_single_asset=false to register anyway)");
+  }
 
   nlohmann::json entry = {
       {"id", id},
@@ -363,6 +433,7 @@ nlohmann::json SimulationModelRegistry::register_model(const nlohmann::json& dat
       {"registered_ms", now_ms()},
       {"sizes", metadata.value("sizes", nlohmann::json::object())},
       {"controllable", controllable},
+      {"scene_like", scene_like},
       {"warnings", metadata.value("warnings", nlohmann::json::array())},
       {"summary", metadata.value("summary", nlohmann::json::object())},
   };

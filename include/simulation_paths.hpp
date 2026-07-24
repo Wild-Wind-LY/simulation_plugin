@@ -17,7 +17,11 @@ std::filesystem::path simulation_data_dir(const std::string& name, const std::st
 namespace simulation {
 
   // Recursively copies `from` into `to`, preserving relative structure. Skips
-  // symlinks and VCS directories (.git/.svn/.hg). If `max_bytes` and/or
+  // symlinks, VCS/editor directories (.git/.svn/.hg/__pycache__/.idea/.vscode)
+  // and OS/editor cruft files (.DS_Store, Thumbs.db, desktop.ini, *~, *.swp) --
+  // this keeps a registered asset package an exact copy of the model's own
+  // files, not a cache or transform, just excluding noise that was never part
+  // of the asset. If `max_bytes` and/or
   // `max_files` are non-zero, pre-scans `from` first and throws
   // std::invalid_argument without copying anything if either cap is exceeded.
   // Shared by the model registry's asset-package snapshot and scene export's

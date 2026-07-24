@@ -1,8 +1,10 @@
 #include "simulation_visual.hpp"
 
 #include <algorithm>
+#include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "simulation_json_utils.hpp"
@@ -26,6 +28,22 @@ namespace {
     if (valb > -6) out.push_back(chars[((val << 8) >> (valb + 8)) & 0x3F]);
     while (out.size() % 4) out.push_back('=');
     return out;
+  }
+
+  // Base64-encodes a numeric buffer's raw bytes directly, instead of letting
+  // nlohmann::json serialize it as a text array of numbers. A JSON number
+  // array is much bigger than the underlying binary data -- float values in
+  // particular round-trip through `double` and often print 15-17 significant
+  // digits (e.g. "0.10000000149011612" for a plain 0.1f), and every value
+  // still carries comma/digit overhead on top of that. Base64 of the raw
+  // bytes is a fixed ~4/3 the binary size regardless of value "ugliness",
+  // which is what actually keeps large meshes under the gateway's 8 MiB
+  // response-body limit (dedup alone brought the vertex *count* back down,
+  // but each remaining number was still costing far more as text than as
+  // binary).
+  template <typename T> std::string base64_encode_binary(const std::vector<T>& values) {
+    return base64_encode(
+        std::string(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(T)));
   }
 
   // geom 的 2D 底色纹理 id（RGB 角色优先，其次 RGBA），非 2D（cube/skybox）返回 -1
@@ -108,11 +126,25 @@ nlohmann::json simulation_visual_json(const mjModel* model, const mjData* data,
         {"xmat", numeric_array(data->geom_xmat + 9 * i, 9)},
         {"size", numeric_array(model->geom_size + 3 * i, 3)},
         {"rgba", numeric_array(model->geom_rgba + 4 * i, 4)},
+        // MuJoCo's own visualizer (`simulate`) lets a user toggle rendering per
+        // geom group (0-5) -- most notably to hide URDF <collision> geoms
+        // (group 0) while keeping <visual> geoms (group 1) visible. Previously
+        // never sent, so this web preview had no way to tell the two apart and
+        // always rendered both stacked on top of each other.
+        {"group", model->geom_group[i]},
     };
     const int material_id = model->geom_matid[i];
     item["material_id"] = material_id;
     if (material_id >= 0 && material_id < model->nmat) {
       item["rgba"] = numeric_array(model->mat_rgba + 4 * material_id, 4);
+      // Compiled by MuJoCo from the material's specular/shininess/reflectance/
+      // emission attributes (compile_asset_declaration passes all four through
+      // faithfully) -- previously never sent, so the web preview could only
+      // ever flat-shade geoms by rgba while `simulate` renders these properly.
+      item["specular"] = model->mat_specular[material_id];
+      item["shininess"] = model->mat_shininess[material_id];
+      item["reflectance"] = model->mat_reflectance[material_id];
+      item["emission"] = model->mat_emission[material_id];
     }
     int texture_id = -1;
     if (include_geometry) {
@@ -129,49 +161,70 @@ nlohmann::json simulation_visual_json(const mjModel* model, const mjData* data,
       item["mesh_id"] = mesh_id;
       if (mesh_id >= 0 && mesh_id < model->nmesh) {
         const int vertex_adr = model->mesh_vertadr[mesh_id];
-        const int vertex_count = model->mesh_vertnum[mesh_id];
         const int face_adr = model->mesh_faceadr[mesh_id];
         const int face_count = model->mesh_facenum[mesh_id];
-        item["vertices"] = numeric_array(model->mesh_vert + 3 * vertex_adr, 3 * vertex_count);
-        nlohmann::json faces = nlohmann::json::array();
+        const int normal_adr = model->mesh_normaladr[mesh_id];
+        const int texcoord_adr = model->mesh_texcoordadr[mesh_id];  // -1: this mesh has no UVs
+        const bool have_uv = texture_id >= 0 && texcoord_adr >= 0 && model->mesh_facetexcoord;
+
+        // Deduplicate by (position, normal, uv) index triple rather than
+        // blindly emitting one vertex per face-corner: MuJoCo's own
+        // mesh_facenormal/mesh_facetexcoord let two faces that touch the same
+        // *position* reference two different normals/UVs (hard edges, UV
+        // seams), which a shared-index BufferGeometry can't represent with a
+        // single normal per position -- but most of a typical mesh is smooth
+        // (every face touching a position agrees on its normal), so most
+        // corners collapse back down to one shared vertex just like before;
+        // only genuine hard edges/seams cost an extra vertex. A prior version
+        // of this export unconditionally emitted 3 fresh vertices per face
+        // (no dedup at all), which roughly tripled payload size and started
+        // tripping the gateway's 8 MiB response-body limit on non-trivial
+        // meshes -- this keeps the same correctness fix at close to the
+        // original size.
+        std::vector<float> positions, normals, uvs;
+        std::vector<int> indices;
+        indices.reserve(static_cast<size_t>(face_count) * 3);
+        std::map<std::tuple<int, int, int>, int> dedup;
+
         for (int face = 0; face < face_count; ++face) {
-          const int* indices = model->mesh_face + 3 * (face_adr + face);
-          faces.push_back({indices[0], indices[1], indices[2]});
-        }
-        item["faces"] = std::move(faces);
-        // 有贴图且 mesh 带 texcoord：给出按顶点对齐的 UV（拓扑不一致时按面角近似回填）
-        if (texture_id >= 0 && model->mesh_texcoordadr[mesh_id] >= 0) {
-          const int texcoord_adr = model->mesh_texcoordadr[mesh_id];
-          const int texcoord_num = model->mesh_texcoordnum[mesh_id];
-          std::vector<float> uvs(static_cast<size_t>(vertex_count) * 2, 0.0f);
-          bool have_uvs = false;
-          if (texcoord_num == vertex_count) {
-            for (int v = 0; v < vertex_count; ++v) {
-              uvs[2 * v] = model->mesh_texcoord[2 * (texcoord_adr + v)];
-              uvs[2 * v + 1] = model->mesh_texcoord[2 * (texcoord_adr + v) + 1];
-            }
-            have_uvs = true;
-          } else if (model->mesh_facetexcoord) {
-            for (int face = 0; face < face_count; ++face) {
-              const int* face_verts = model->mesh_face + 3 * (face_adr + face);
-              const int* face_tc = model->mesh_facetexcoord + 3 * (face_adr + face);
-              for (int corner = 0; corner < 3; ++corner) {
-                const int v = face_verts[corner];
-                const int t = face_tc[corner];
-                if (v >= 0 && v < vertex_count && t >= 0 && t < texcoord_num) {
-                  uvs[2 * v] = model->mesh_texcoord[2 * (texcoord_adr + t)];
-                  uvs[2 * v + 1] = model->mesh_texcoord[2 * (texcoord_adr + t) + 1];
-                  have_uvs = true;
-                }
+          const int* verts = model->mesh_face + 3 * (face_adr + face);
+          const int* fnorm = model->mesh_facenormal + 3 * (face_adr + face);
+          const int* ftex = have_uv ? model->mesh_facetexcoord + 3 * (face_adr + face) : nullptr;
+          for (int corner = 0; corner < 3; ++corner) {
+            const int pidx = verts[corner];
+            const int nidx = fnorm[corner];
+            const int tidx = have_uv ? ftex[corner] : -1;
+            const auto key = std::make_tuple(pidx, nidx, tidx);
+            const auto it = dedup.find(key);
+            int compact;
+            if (it != dedup.end()) {
+              compact = it->second;
+            } else {
+              compact = static_cast<int>(positions.size() / 3);
+              dedup.emplace(key, compact);
+              const int v = vertex_adr + pidx;
+              positions.push_back(model->mesh_vert[3 * v]);
+              positions.push_back(model->mesh_vert[3 * v + 1]);
+              positions.push_back(model->mesh_vert[3 * v + 2]);
+              const int n = normal_adr + nidx;
+              normals.push_back(model->mesh_normal[3 * n]);
+              normals.push_back(model->mesh_normal[3 * n + 1]);
+              normals.push_back(model->mesh_normal[3 * n + 2]);
+              if (have_uv) {
+                const int t = texcoord_adr + tidx;
+                uvs.push_back(model->mesh_texcoord[2 * t]);
+                uvs.push_back(model->mesh_texcoord[2 * t + 1]);
               }
             }
-          }
-          if (have_uvs) {
-            nlohmann::json uv_json = nlohmann::json::array();
-            for (float v : uvs) uv_json.push_back(static_cast<double>(v));
-            item["uvs"] = std::move(uv_json);
+            indices.push_back(compact);
           }
         }
+        // *_b64 = base64 of the raw float32/int32 bytes (little-endian, matching
+        // every realistic browser target) -- see base64_encode_binary's comment.
+        item["positions_b64"] = base64_encode_binary(positions);
+        item["normals_b64"] = base64_encode_binary(normals);
+        if (have_uv) item["uvs_b64"] = base64_encode_binary(uvs);
+        item["indices_b64"] = base64_encode_binary(indices);
       }
     } else if (include_geometry && type == mjGEOM_HFIELD) {
       const int hfield_id = model->geom_dataid[i];

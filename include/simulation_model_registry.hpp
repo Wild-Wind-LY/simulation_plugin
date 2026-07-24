@@ -36,6 +36,11 @@ public:
   //   asset_root      (optional) directory to snapshot; defaults to the model's
   //                   parent directory; must be an ancestor of the model file
   //   require_actuators (default false) reject models with no actuators
+  //   require_single_asset (default false) reject models that look like a whole
+  //                   scene (multiple independently-jointed root subtrees, or a
+  //                   world-attached ground plane) rather than one reusable
+  //                   asset; when false (default) this only adds a warning to
+  //                   entry.warnings/scene_like instead of rejecting
   //   max_asset_bytes (optional) cap for the snapshotted package size
   nlohmann::json register_model(const nlohmann::json& data);
   nlohmann::json list() const;
